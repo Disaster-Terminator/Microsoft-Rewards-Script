@@ -88,6 +88,7 @@ COPY src/config.example.json ./src/config.example.json
 # dist/ so the app finds them at its expected paths, while the entrypoint
 # writes to dist/config/ which maps to the user-facing ./config/ volume mount
 RUN mkdir -p ./dist/config \
+    && rm -f ./dist/config.json ./dist/accounts.json \
     && ln -s /usr/src/microsoft-rewards-script/dist/config/config.json ./dist/config.json \
     && ln -s /usr/src/microsoft-rewards-script/dist/config/accounts.json ./dist/accounts.json
 

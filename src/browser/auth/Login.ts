@@ -168,6 +168,11 @@ export class Login {
             return 'CHROMEWEBDATA_ERROR'
         }
 
+        if (url.hostname === 'login.microsoft.com' && url.pathname.includes('/consumers/fido/')) {
+            this.bot.logger.debug(this.bot.isMobile, 'DETECT-STATE', 'Detected FIDO passkey redirect page')
+            return 'PASSKEY_ERROR'
+        }
+
         const isLocked = await this.checkSelector(page, this.selectors.accountLocked)
         if (isLocked) {
             this.bot.logger.debug(this.bot.isMobile, 'DETECT-STATE', 'Account locked selector found')
@@ -487,7 +492,21 @@ export class Login {
             case 'PASSKEY_VIDEO':
             case 'PASSKEY_ERROR': {
                 this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Skipping Passkey prompt')
-                await this.bot.browser.utils.ghostClick(page, this.selectors.secondaryButton)
+
+                const signInAnotherWaySelector =
+                    'a:has-text("Sign in another way"), a:has-text("sign in another way")'
+                const signInAnotherWay = await page
+                    .waitForSelector(signInAnotherWaySelector, { state: 'visible', timeout: 2000 })
+                    .catch(() => null)
+
+                if (signInAnotherWay) {
+                    await signInAnotherWay.click()
+                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Clicked "Sign in another way" on FIDO page')
+                } else {
+                    await this.bot.browser.utils.ghostClick(page, this.selectors.secondaryButton)
+                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Clicked secondary button to skip Passkey prompt')
+                }
+
                 await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
                     this.bot.logger.debug(this.bot.isMobile, 'LOGIN', 'Network idle timeout after Passkey skip')
                 })
