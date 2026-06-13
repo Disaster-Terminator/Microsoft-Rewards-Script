@@ -286,6 +286,31 @@ export class Login {
             .catch(() => false)
     }
 
+    private isBingHost(hostname: string): boolean {
+        return hostname === 'bing.com' || hostname.endsWith('.bing.com')
+    }
+
+    private isRewardsHost(hostname: string): boolean {
+        return hostname === 'rewards.bing.com'
+    }
+
+    private getRewardsUrl(pathname: string): string {
+        const url = new URL(this.bot.config.baseURL)
+        url.pathname = pathname
+        url.search = ''
+        url.hash = ''
+        url.searchParams.set('_', Date.now().toString())
+        return url.toString()
+    }
+
+    private getRewardsHomeUrl(): string {
+        return this.getRewardsUrl('/')
+    }
+
+    private getRewardsDashboardUrl(): string {
+        return this.getRewardsUrl('/dashboard')
+    }
+
     private async handleState(state: LoginState, page: Page, account: Account): Promise<boolean> {
         this.bot.logger.debug(this.bot.isMobile, 'HANDLE-STATE', `Processing state: ${state}`)
 
@@ -624,7 +649,7 @@ export class Login {
                 }
 
                 const u = new URL(page.url())
-                const atBingHome = u.hostname === 'www.bing.com' && u.pathname === '/'
+                const atBingHome = this.isBingHost(u.hostname) && u.pathname === '/'
                 this.bot.logger.debug(
                     this.bot.isMobile,
                     'LOGIN-BING',
@@ -662,72 +687,78 @@ export class Login {
 
     private async getRewardsSession(page: Page) {
         const loopMax = 5
+        const sessionUrls = [this.getRewardsHomeUrl(), this.getRewardsDashboardUrl()]
 
         this.bot.logger.info(this.bot.isMobile, 'GET-REWARD-SESSION', 'Fetching request token')
 
         try {
-            await page
-                .goto(`${this.bot.config.baseURL}?_=${Date.now()}`, { waitUntil: 'networkidle', timeout: 10000 })
-                .catch(() => {})
+            for (const sessionUrl of sessionUrls) {
+                await page.goto(sessionUrl, { waitUntil: 'networkidle', timeout: 10000 }).catch(() => {})
 
-            for (let i = 0; i < loopMax; i++) {
-                if (page.isClosed()) break
+                for (let i = 0; i < loopMax; i++) {
+                    if (page.isClosed()) break
 
-                this.bot.logger.debug(this.bot.isMobile, 'GET-REWARD-SESSION', `Token fetch loop ${i + 1}/${loopMax}`)
-
-                const u = new URL(page.url())
-                const atRewardHome = u.hostname === 'rewards.bing.com' && u.pathname === '/'
-
-                if (atRewardHome) {
-                    await this.bot.browser.utils.tryDismissAllMessages(page)
-
-                    const html = await page.content()
-                    const $ = await this.bot.browser.utils.loadInCheerio(html)
-
-                    // Check which version of the dashboard is being used, disable requestToken req on new dash
-                    const isModernDashboard = $('section#dailyset').length > 0 // Only on new UI and on dashboard/overview page
-
-                    if (isModernDashboard) {
-                        this.bot.rewardsVersion = 'modern'
-
-                        this.bot.logger.warn(
-                            this.bot.isMobile,
-                            'GET-REWARD-SESSION',
-                            'Modern Rewards dashboard detected. This script version may not fully support it.'
-                        )
-
-                        this.bot.logger.warn(
-                            this.bot.isMobile,
-                            'GET-REWARD-SESSION',
-                            'RequestToken disabled for this session (expected behavior).'
-                        )
-                    }
-
-                    const token =
-                        $(this.selectors.requestToken).attr('value') ??
-                        $(this.selectors.requestTokenMeta).attr('content') ??
-                        null
-
-                    if (token) {
-                        this.bot.requestToken = token
-                        this.bot.logger.info(
-                            this.bot.isMobile,
-                            'GET-REWARD-SESSION',
-                            `Request token retrieved: ${token.substring(0, 10)}...`
-                        )
-                        return
-                    }
-
-                    this.bot.logger.debug(this.bot.isMobile, 'GET-REWARD-SESSION', 'Token not found on page')
-                } else {
                     this.bot.logger.debug(
                         this.bot.isMobile,
                         'GET-REWARD-SESSION',
-                        `Not at reward home: ${u.hostname}${u.pathname}`
+                        `Token fetch loop ${i + 1}/${loopMax}`
                     )
-                }
 
-                await this.bot.utils.wait(1000)
+                    const u = new URL(page.url())
+                    const atRewards = this.isRewardsHost(u.hostname)
+
+                    if (atRewards) {
+                        await this.bot.browser.utils.tryDismissAllMessages(page)
+
+                        const html = await page.content()
+                        const $ = await this.bot.browser.utils.loadInCheerio(html)
+
+                        const token =
+                            $(this.selectors.requestToken).attr('value') ??
+                            $(this.selectors.requestTokenMeta).attr('content') ??
+                            null
+
+                        if (token) {
+                            this.bot.requestToken = token
+                            this.bot.logger.info(
+                                this.bot.isMobile,
+                                'GET-REWARD-SESSION',
+                                `Request token retrieved: ${token.substring(0, 10)}...`
+                            )
+                            return
+                        }
+
+                        // Check which version of the dashboard is being used, disable requestToken req on new dash
+                        const isModernDashboard = $('section#dailyset').length > 0 // Only on new UI and on dashboard/overview page
+
+                        if (isModernDashboard) {
+                            this.bot.rewardsVersion = 'modern'
+
+                            this.bot.logger.warn(
+                                this.bot.isMobile,
+                                'GET-REWARD-SESSION',
+                                'Modern Rewards dashboard detected. This script version may not fully support it.'
+                            )
+
+                            this.bot.logger.warn(
+                                this.bot.isMobile,
+                                'GET-REWARD-SESSION',
+                                'RequestToken disabled for this session (expected behavior).'
+                            )
+                            return
+                        }
+
+                        this.bot.logger.debug(this.bot.isMobile, 'GET-REWARD-SESSION', 'Token not found on page')
+                    } else {
+                        this.bot.logger.debug(
+                            this.bot.isMobile,
+                            'GET-REWARD-SESSION',
+                            `Not at Rewards host: ${u.hostname}${u.pathname}`
+                        )
+                    }
+
+                    await this.bot.utils.wait(1000)
+                }
             }
 
             this.bot.logger.warn(
