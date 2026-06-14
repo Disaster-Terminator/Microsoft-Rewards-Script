@@ -294,7 +294,7 @@ export default class BrowserFunc {
 
     async ensureStreakProtection() {
         try {
-            if (!this.bot.requestToken && this.bot.rewardsVersion === 'legacy') {
+            if (!this.bot.requestToken) {
                 this.bot.logger.warn(
                     this.bot.isMobile,
                     'ENABLE-STREAK-PROTECTION',

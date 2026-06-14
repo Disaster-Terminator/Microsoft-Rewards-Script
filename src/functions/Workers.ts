@@ -16,6 +16,17 @@ export class Workers {
         this.bot = bot
     }
 
+    protected skipIfRequestTokenMissing(scope: string): boolean {
+        if (this.bot.requestToken) return false
+
+        this.bot.logger.warn(
+            this.bot.isMobile,
+            scope,
+            'Skipping: Request token not available, this activity requires it!'
+        )
+        return true
+    }
+
     public async doDailySet(data: DashboardData, page: Page) {
         const todayKey = this.bot.utils.getFormattedDate()
         const todayData = data.dailySetPromotions[todayKey]

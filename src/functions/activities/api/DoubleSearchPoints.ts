@@ -12,14 +12,7 @@ export class DoubleSearchPoints extends Workers {
         const activityType = promotion.activityType
 
         try {
-            if (!this.bot.requestToken && this.bot.rewardsVersion === 'legacy') {
-                this.bot.logger.warn(
-                    this.bot.isMobile,
-                    'DOUBLE-SEARCH-POINTS',
-                    'Skipping: Request token not available, this activity requires it!'
-                )
-                return
-            }
+            if (this.skipIfRequestTokenMissing('DOUBLE-SEARCH-POINTS')) return
 
             this.cookieHeader = this.bot.browser.func.buildCookieHeader(
                 this.bot.isMobile ? this.bot.cookies.mobile : this.bot.cookies.desktop,

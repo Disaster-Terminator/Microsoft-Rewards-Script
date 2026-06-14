@@ -179,6 +179,8 @@ export class SearchOnBing extends Workers {
     // The task needs to be activated before being able to complete it
     private async activateSearchTask(promotion: BasePromotion): Promise<boolean> {
         try {
+            if (this.skipIfRequestTokenMissing('SEARCH-ON-BING-ACTIVATE')) return false
+
             this.bot.logger.debug(
                 this.bot.isMobile,
                 'SEARCH-ON-BING-ACTIVATE',

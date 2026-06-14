@@ -11,14 +11,7 @@ export class ClaimBonusPoints extends Workers {
     private oldBalance: number = this.bot.userData.currentPoints
 
     public async claimBonusPoints() {
-        if (!this.bot.requestToken && this.bot.rewardsVersion === 'legacy') {
-            this.bot.logger.warn(
-                this.bot.isMobile,
-                'CLAIM-BONUS-POINTS',
-                'Skipping: Request token not available, this activity requires it!'
-            )
-            return
-        }
+        if (this.skipIfRequestTokenMissing('CLAIM-BONUS-POINTS')) return
 
         this.bot.logger.info(
             this.bot.isMobile,
