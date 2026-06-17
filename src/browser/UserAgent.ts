@@ -4,8 +4,22 @@ import type { BrowserFingerprintWithHeaders } from 'fingerprint-generator'
 import type { ChromeVersion, EdgeVersion } from '../interface/UserAgentUtil'
 import type { MicrosoftRewardsBot } from '../index'
 
+interface AppComponents {
+    not_a_brand_version: string
+    not_a_brand_major_version: string
+    edge_version: string
+    edge_major_version: string
+    chrome_version: string
+    chrome_major_version: string
+    chrome_reduced_version: string
+}
+
 export class UserAgentManager {
     private static readonly NOT_A_BRAND_VERSION = '99'
+    private static readonly FALLBACK_CHROME_VERSION = '149.0.0.0'
+    private static readonly FALLBACK_EDGE_ANDROID_VERSION = '149.0.4022.67'
+    private static readonly FALLBACK_EDGE_WINDOWS_VERSION = '149.0.4022.69'
+    private readonly appComponentsCache = new Map<string, Promise<AppComponents>>()
 
     constructor(private bot: MicrosoftRewardsBot) {}
 
@@ -60,7 +74,12 @@ export class UserAgentManager {
                 'USERAGENT-CHROME-VERSION',
                 `An error occurred: ${error instanceof Error ? error.message : String(error)}`
             )
-            throw error
+            this.bot.logger.warn(
+                isMobile,
+                'USERAGENT-CHROME-VERSION-FALLBACK',
+                `Using fallback Chrome version ${UserAgentManager.FALLBACK_CHROME_VERSION}`
+            )
+            return UserAgentManager.FALLBACK_CHROME_VERSION
         }
     }
 
@@ -77,17 +96,38 @@ export class UserAgentManager {
             const response = await axios(request)
             const data: EdgeVersion[] = response.data
             const stable = data.find(x => x.Product == 'Stable') as EdgeVersion
-            return {
+            const versions = {
                 android: stable.Releases.find(x => x.Platform == 'Android')?.ProductVersion,
                 windows: stable.Releases.find(x => x.Platform == 'Windows' && x.Architecture == 'x64')?.ProductVersion
             }
+            if (!versions.android || !versions.windows) {
+                this.bot.logger.warn(
+                    isMobile,
+                    'USERAGENT-EDGE-VERSION-FALLBACK',
+                    'Using fallback Edge versions because stable channel data is incomplete'
+                )
+                return this.fallbackEdgeVersions()
+            }
+            return versions
         } catch (error) {
             this.bot.logger.error(
                 isMobile,
                 'USERAGENT-EDGE-VERSION',
                 `An error occurred: ${error instanceof Error ? error.message : String(error)}`
             )
-            throw error
+            this.bot.logger.warn(
+                isMobile,
+                'USERAGENT-EDGE-VERSION-FALLBACK',
+                'Using fallback Edge versions after update failed'
+            )
+            return this.fallbackEdgeVersions()
+        }
+    }
+
+    private fallbackEdgeVersions() {
+        return {
+            android: UserAgentManager.FALLBACK_EDGE_ANDROID_VERSION,
+            windows: UserAgentManager.FALLBACK_EDGE_WINDOWS_VERSION
         }
     }
 
@@ -100,7 +140,22 @@ export class UserAgentManager {
         return 'Windows NT 10.0; Win64; x64'
     }
 
-    async getAppComponents(isMobile: boolean) {
+    async getAppComponents(isMobile: boolean): Promise<AppComponents> {
+        const cacheKey = isMobile ? 'mobile' : 'desktop'
+        const cached = this.appComponentsCache.get(cacheKey)
+        if (cached) {
+            return cached
+        }
+
+        const promise = this.buildAppComponents(isMobile).catch(error => {
+            this.appComponentsCache.delete(cacheKey)
+            throw error
+        })
+        this.appComponentsCache.set(cacheKey, promise)
+        return promise
+    }
+
+    private async buildAppComponents(isMobile: boolean): Promise<AppComponents> {
         const versions = await this.getEdgeVersions(isMobile)
         const edgeVersion = isMobile ? versions.android : (versions.windows as string)
         const edgeMajorVersion = edgeVersion?.split('.')[0]

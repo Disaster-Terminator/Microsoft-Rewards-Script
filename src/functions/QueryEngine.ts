@@ -1,28 +1,44 @@
-import type { AxiosRequestConfig } from 'axios'
+import type { AxiosRequestConfig, AxiosResponse } from 'axios'
 import * as fs from 'fs'
 import path from 'path'
 import type { GoogleSearch, GoogleTrendsResponse, RedditListing, WikipediaTopResponse } from '../interface/Search'
 import type { MicrosoftRewardsBot } from '../index'
 import { QueryEngine } from '../interface/Config'
 
+const DEFAULT_QUERY_REQUEST_TIMEOUT_MS = 5000
+const DEFAULT_RELATED_EXPANSION_BUDGET_MS = 15000
+const DEFAULT_RELATED_EXPANSION_LIMIT = 12
+
+interface QueryManagerOptions {
+    shuffle?: boolean
+    sourceOrder?: QueryEngine[]
+    related?: boolean
+    langCode?: string
+    geoLocale?: string
+    requestTimeoutMs?: number
+    relatedExpansionBudgetMs?: number
+    relatedExpansionLimit?: number
+}
+
+interface RelatedExpansionOptions {
+    requestTimeoutMs: number
+    budgetMs: number
+    limit: number
+}
+
 export class QueryCore {
     constructor(private bot: MicrosoftRewardsBot) {}
 
-    async queryManager(
-        options: {
-            shuffle?: boolean
-            sourceOrder?: QueryEngine[]
-            related?: boolean
-            langCode?: string
-            geoLocale?: string
-        } = {}
-    ): Promise<string[]> {
+    async queryManager(options: QueryManagerOptions = {}): Promise<string[]> {
         const {
             shuffle = false,
             sourceOrder = ['google', 'wikipedia', 'reddit', 'local'],
             related = true,
             langCode = 'en',
-            geoLocale = 'US'
+            geoLocale = 'US',
+            requestTimeoutMs = DEFAULT_QUERY_REQUEST_TIMEOUT_MS,
+            relatedExpansionBudgetMs = DEFAULT_RELATED_EXPANSION_BUDGET_MS,
+            relatedExpansionLimit = DEFAULT_RELATED_EXPANSION_LIMIT
         } = options
 
         try {
@@ -39,17 +55,17 @@ export class QueryCore {
                 (() => Promise<string[]>) | (() => string[])
             > = {
                 google: async () => {
-                    const topics = await this.getGoogleTrends(geoLocale.toUpperCase()).catch(() => [])
+                    const topics = await this.getGoogleTrends(geoLocale.toUpperCase(), requestTimeoutMs).catch(() => [])
                     this.bot.logger.debug(this.bot.isMobile, 'QUERY-MANAGER', `google: ${topics.length}`)
                     return topics
                 },
                 wikipedia: async () => {
-                    const topics = await this.getWikipediaTrending(langCode).catch(() => [])
+                    const topics = await this.getWikipediaTrending(langCode, requestTimeoutMs).catch(() => [])
                     this.bot.logger.debug(this.bot.isMobile, 'QUERY-MANAGER', `wikipedia: ${topics.length}`)
                     return topics
                 },
                 reddit: async () => {
-                    const topics = await this.getRedditTopics().catch(() => [])
+                    const topics = await this.getRedditTopics('popular', requestTimeoutMs).catch(() => [])
                     this.bot.logger.debug(this.bot.isMobile, 'QUERY-MANAGER', `reddit: ${topics.length}`)
                     return topics
                 },
@@ -88,7 +104,13 @@ export class QueryCore {
             )
             this.bot.logger.debug(this.bot.isMobile, 'QUERY-MANAGER', `baseTopics: ${baseTopics.length}`)
 
-            const clusters = related ? await this.buildRelatedClusters(baseTopics, langCode) : baseTopics.map(t => [t])
+            const clusters = related
+                ? await this.buildRelatedClusters(baseTopics, langCode, {
+                      requestTimeoutMs,
+                      budgetMs: relatedExpansionBudgetMs,
+                      limit: relatedExpansionLimit
+                  })
+                : baseTopics.map(t => [t])
 
             this.bot.utils.shuffleArray(clusters)
             this.bot.logger.debug(this.bot.isMobile, 'QUERY-MANAGER', 'clusters shuffled')
@@ -131,12 +153,16 @@ export class QueryCore {
         }
     }
 
-    private async buildRelatedClusters(baseTopics: string[], langCode: string): Promise<string[][]> {
+    private async buildRelatedClusters(
+        baseTopics: string[],
+        langCode: string,
+        options: RelatedExpansionOptions
+    ): Promise<string[][]> {
         const clusters: string[][] = []
 
-        const LIMIT = 50
-        const head = baseTopics.slice(0, LIMIT)
-        const tail = baseTopics.slice(LIMIT)
+        const started = Date.now()
+        const head = baseTopics.slice(0, options.limit)
+        const tail = baseTopics.slice(options.limit)
 
         this.bot.logger.debug(
             this.bot.isMobile,
@@ -146,12 +172,24 @@ export class QueryCore {
         this.bot.logger.debug(
             this.bot.isMobile,
             'QUERY-MANAGER',
-            `bing expansion enabled | limit=${LIMIT} | totalCalls=${head.length * 2}`
+            `bing expansion enabled | limit=${options.limit} | budgetMs=${options.budgetMs} | requestTimeoutMs=${options.requestTimeoutMs} | totalCalls=${head.length * 2}`
         )
 
         for (const topic of head) {
-            const suggestions = await this.getBingSuggestions(topic, langCode).catch(() => [])
-            const relatedTerms = await this.getBingRelatedTerms(topic).catch(() => [])
+            if (Date.now() - started >= options.budgetMs) {
+                this.bot.logger.warn(
+                    this.bot.isMobile,
+                    'QUERY-MANAGER',
+                    `related expansion budget exhausted | elapsedMs=${Date.now() - started} | remainingTopics=${
+                        head.length - clusters.length
+                    }`
+                )
+                clusters.push(...head.slice(clusters.length).map(t => [t]))
+                break
+            }
+
+            const suggestions = await this.getBingSuggestions(topic, langCode, options.requestTimeoutMs).catch(() => [])
+            const relatedTerms = await this.getBingRelatedTerms(topic, options.requestTimeoutMs).catch(() => [])
 
             const usedSuggestions = suggestions.slice(0, 6)
             const usedRelated = relatedTerms.slice(0, 3)
@@ -178,6 +216,26 @@ export class QueryCore {
         return clusters
     }
 
+    private async queryRequest(request: AxiosRequestConfig, timeoutMs: number): Promise<AxiosResponse> {
+        let timer: ReturnType<typeof setTimeout> | undefined
+        try {
+            return await Promise.race([
+                this.bot.axios.request(
+                    {
+                        ...request,
+                        timeout: request.timeout ?? timeoutMs
+                    },
+                    this.bot.config.proxy.queryEngine
+                ),
+                new Promise<never>((_, reject) => {
+                    timer = setTimeout(() => reject(new Error(`Query request timeout after ${timeoutMs}ms`)), timeoutMs)
+                })
+            ])
+        } finally {
+            if (timer) clearTimeout(timer)
+        }
+    }
+
     private normalizeAndDedupe(queries: string[]): string[] {
         const seen = new Set<string>()
         const out: string[] = []
@@ -197,7 +255,10 @@ export class QueryCore {
         return out
     }
 
-    async getGoogleTrends(geoLocale: string): Promise<string[]> {
+    async getGoogleTrends(
+        geoLocale: string,
+        requestTimeoutMs = DEFAULT_QUERY_REQUEST_TIMEOUT_MS
+    ): Promise<string[]> {
         const queryTerms: GoogleSearch[] = []
 
         try {
@@ -210,7 +271,7 @@ export class QueryCore {
                 data: `f.req=[[[i0OFE,"[null, null, \\"${geoLocale.toUpperCase()}\\", 0, null, 48]"]]]`
             }
 
-            const response = await this.bot.axios.request(request, this.bot.config.proxy.queryEngine)
+            const response = await this.queryRequest(request, requestTimeoutMs)
             const trendsData = this.extractJsonFromResponse(response.data)
             if (!trendsData) {
                 this.bot.logger.debug(this.bot.isMobile, 'SEARCH-GOOGLE-TRENDS', 'No trendsData parsed from response')
@@ -220,7 +281,7 @@ export class QueryCore {
             const mapped = trendsData.map(q => [q[0], q[9]!.slice(1)])
 
             if (mapped.length < 90 && geoLocale !== 'US') {
-                return this.getGoogleTrends('US')
+                return this.getGoogleTrends('US', requestTimeoutMs)
             }
 
             for (const [topic, related] of mapped) {
@@ -254,7 +315,11 @@ export class QueryCore {
         return null
     }
 
-    async getBingSuggestions(query = '', langCode = 'en'): Promise<string[]> {
+    async getBingSuggestions(
+        query = '',
+        langCode = 'en',
+        requestTimeoutMs = DEFAULT_QUERY_REQUEST_TIMEOUT_MS
+    ): Promise<string[]> {
         try {
             const request: AxiosRequestConfig = {
                 url: `https://www.bingapis.com/api/v7/suggestions?q=${encodeURIComponent(
@@ -267,7 +332,7 @@ export class QueryCore {
                 }
             }
 
-            const response = await this.bot.axios.request(request, this.bot.config.proxy.queryEngine)
+            const response = await this.queryRequest(request, requestTimeoutMs)
             const suggestions =
                 response.data.suggestionGroups?.[0]?.searchSuggestions?.map((x: { query: string }) => x.query) ?? []
 
@@ -292,7 +357,7 @@ export class QueryCore {
         }
     }
 
-    async getBingRelatedTerms(query: string): Promise<string[]> {
+    async getBingRelatedTerms(query: string, requestTimeoutMs = DEFAULT_QUERY_REQUEST_TIMEOUT_MS): Promise<string[]> {
         try {
             const request: AxiosRequestConfig = {
                 url: `https://api.bing.com/osjson.aspx?query=${encodeURIComponent(query)}`,
@@ -302,7 +367,7 @@ export class QueryCore {
                 }
             }
 
-            const response = await this.bot.axios.request(request, this.bot.config.proxy.queryEngine)
+            const response = await this.queryRequest(request, requestTimeoutMs)
             const related = response.data?.[1]
             const out = Array.isArray(related) ? related : []
 
@@ -327,7 +392,10 @@ export class QueryCore {
         }
     }
 
-    async getBingTrendingTopics(langCode = 'en'): Promise<string[]> {
+    async getBingTrendingTopics(
+        langCode = 'en',
+        requestTimeoutMs = DEFAULT_QUERY_REQUEST_TIMEOUT_MS
+    ): Promise<string[]> {
         try {
             const request: AxiosRequestConfig = {
                 url: `https://www.bing.com/api/v7/news/trendingtopics?appid=91B36E34F9D1B900E54E85A77CF11FB3BE5279E6&cc=xl&setlang=${langCode}`,
@@ -343,7 +411,7 @@ export class QueryCore {
                 }
             }
 
-            const response = await this.bot.axios.request(request, this.bot.config.proxy.queryEngine)
+            const response = await this.queryRequest(request, requestTimeoutMs)
             const topics =
                 response.data.value?.map(
                     (x: { query: { text: string }; name: string }) => x.query?.text?.trim() || x.name.trim()
@@ -370,7 +438,10 @@ export class QueryCore {
         }
     }
 
-    async getWikipediaTrending(langCode = 'en'): Promise<string[]> {
+    async getWikipediaTrending(
+        langCode = 'en',
+        requestTimeoutMs = DEFAULT_QUERY_REQUEST_TIMEOUT_MS
+    ): Promise<string[]> {
         try {
             const date = new Date(Date.now() - 24 * 60 * 60 * 1000)
             const yyyy = date.getUTCFullYear()
@@ -385,7 +456,7 @@ export class QueryCore {
                 }
             }
 
-            const response = await this.bot.axios.request(request, this.bot.config.proxy.queryEngine)
+            const response = await this.queryRequest(request, requestTimeoutMs)
             const articles = (response.data as WikipediaTopResponse).items?.[0]?.articles ?? []
 
             const out = articles.slice(0, 50).map(a => a.article.replace(/_/g, ' '))
@@ -411,7 +482,10 @@ export class QueryCore {
         }
     }
 
-    async getRedditTopics(subreddit = 'popular'): Promise<string[]> {
+    async getRedditTopics(
+        subreddit = 'popular',
+        requestTimeoutMs = DEFAULT_QUERY_REQUEST_TIMEOUT_MS
+    ): Promise<string[]> {
         try {
             const safe = subreddit.replace(/[^a-zA-Z0-9_+]/g, '')
             const request: AxiosRequestConfig = {
@@ -422,7 +496,7 @@ export class QueryCore {
                 }
             }
 
-            const response = await this.bot.axios.request(request, this.bot.config.proxy.queryEngine)
+            const response = await this.queryRequest(request, requestTimeoutMs)
             const posts = (response.data as RedditListing).data?.children ?? []
 
             const out = posts.filter(p => !p.data.over_18).map(p => p.data.title)
