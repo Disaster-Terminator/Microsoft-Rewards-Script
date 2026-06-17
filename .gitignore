@@ -1,4 +1,6 @@
 sessions/
+config/
+.serena/
 dist/
 .dev/
 node_modules/
