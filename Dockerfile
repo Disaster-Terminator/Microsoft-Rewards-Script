@@ -29,6 +29,8 @@ FROM node:24-slim AS runtime
 
 WORKDIR /usr/src/microsoft-rewards-script
 
+ARG DEBIAN_MIRROR=""
+
 # Set production environment variables
 ENV NODE_ENV=production \
     TZ=UTC \
@@ -38,7 +40,15 @@ ENV NODE_ENV=production \
 
 # Install minimal system libraries required for Chromium headless to run,
 # plus jq (for config generation/patching) and gettext-base (for envsubst)
-RUN apt-get update && apt-get install -y --no-install-recommends \
+COPY --chmod=755 scripts/docker/retry-command.sh /usr/local/bin/retry-command
+RUN if [ -n "$DEBIAN_MIRROR" ]; then \
+        sed -i \
+            -e "s|http://deb.debian.org/debian-security|$DEBIAN_MIRROR/debian-security|g" \
+            -e "s|http://deb.debian.org/debian|$DEBIAN_MIRROR/debian|g" \
+            /etc/apt/sources.list.d/debian.sources; \
+    fi \
+    && retry-command 3 apt-get -o Acquire::Retries=5 update \
+    && retry-command 3 apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
     cron \
     gettext-base \
     jq \
@@ -86,7 +96,7 @@ COPY --from=builder /usr/src/microsoft-rewards-script/node_modules ./node_module
 # Install patchright's stealth-patched Chromium headless shell.
 # The container is headless-only so the full browser isn't needed; then clean up
 RUN set -eux; \
-    npx patchright install --with-deps --only-shell chromium; \
+    retry-command 3 npx patchright install --with-deps --only-shell chromium; \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # Copy config example into the image so entrypoint can use it as a fallback
