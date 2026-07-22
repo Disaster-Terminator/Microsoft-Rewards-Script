@@ -51,6 +51,10 @@ interface AccountStats {
     error?: string
 }
 
+function accountRunExitCode(stats: AccountStats[]): number {
+    return stats.some(account => !account.success) ? 1 : 0
+}
+
 const executionContext = new AsyncLocalStorage<ExecutionContext>()
 
 export function getCurrentContext(): ExecutionContext {
@@ -259,18 +263,20 @@ export class MicrosoftRewardsBot {
                 const totalCollectedPoints = allAccountStats.reduce((sum, s) => sum + s.collectedPoints, 0)
                 const totalInitialPoints = allAccountStats.reduce((sum, s) => sum + s.initialPoints, 0)
                 const totalFinalPoints = allAccountStats.reduce((sum, s) => sum + s.finalPoints, 0)
+                const failedAccounts = allAccountStats.filter(account => !account.success).length
+                const runExitCode = hadWorkerFailure || accountRunExitCode(allAccountStats) !== 0 ? 1 : 0
                 const totalDurationMinutes = ((Date.now() - runStartTime) / 1000 / 60).toFixed(1)
 
                 this.logger.info(
                     'main',
                     'RUN-END',
-                    `Completed all accounts | accountsProcessed=${allAccountStats.length} | pointsGained=${totalCollectedPoints} | previousBalance=${totalInitialPoints} | currentBalance=${totalFinalPoints} | runtimeMinutes=${totalDurationMinutes}`,
-                    'green'
+                    `Completed all accounts | accountsProcessed=${allAccountStats.length} | accountsFailed=${failedAccounts} | pointsGained=${totalCollectedPoints} | previousBalance=${totalInitialPoints} | currentBalance=${totalFinalPoints} | runtimeMinutes=${totalDurationMinutes}`,
+                    runExitCode === 0 ? 'green' : 'red'
                 )
 
                 await flushAllWebhooks()
 
-                process.exit(hadWorkerFailure ? 1 : 0)
+                process.exit(runExitCode)
             }
         }
 
@@ -302,7 +308,7 @@ export class MicrosoftRewardsBot {
                 }
 
                 await flushAllWebhooks()
-                process.exit(0)
+                process.exit(accountRunExitCode(stats))
             } catch (error) {
                 this.logger.error(
                     'main',
@@ -403,17 +409,19 @@ export class MicrosoftRewardsBot {
             const totalCollectedPoints = accountStats.reduce((sum, s) => sum + s.collectedPoints, 0)
             const totalInitialPoints = accountStats.reduce((sum, s) => sum + s.initialPoints, 0)
             const totalFinalPoints = accountStats.reduce((sum, s) => sum + s.finalPoints, 0)
+            const failedAccounts = accountStats.filter(account => !account.success).length
+            const runExitCode = accountRunExitCode(accountStats)
             const totalDurationMinutes = ((Date.now() - runStartTime) / 1000 / 60).toFixed(1)
 
             this.logger.info(
                 'main',
                 'RUN-END',
-                `Completed all accounts | accountsProcessed=${accountStats.length} | pointsGained=${totalCollectedPoints} | previousBalance=${totalInitialPoints} | currentBalance=${totalFinalPoints} | runtimeMinutes=${totalDurationMinutes}`,
-                'green'
+                `Completed all accounts | accountsProcessed=${accountStats.length} | accountsFailed=${failedAccounts} | pointsGained=${totalCollectedPoints} | previousBalance=${totalInitialPoints} | currentBalance=${totalFinalPoints} | runtimeMinutes=${totalDurationMinutes}`,
+                runExitCode === 0 ? 'green' : 'red'
             )
 
             await flushAllWebhooks()
-            process.exit(0)
+            process.exit(runExitCode)
         }
 
         return accountStats

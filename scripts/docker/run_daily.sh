@@ -159,6 +159,7 @@ fi
 
 # Start the actual script
 echo "[$(date)] [run_daily.sh] Starting script..."
+run_status=0
 if [ "${API_MODE:-false}" = "true" ]; then
     # API-integrated mode: delegate to the API server so the dashboard has full
     # visibility and control.  trigger.js calls POST /start and waits for idle.
@@ -166,14 +167,17 @@ if [ "${API_MODE:-false}" = "true" ]; then
         echo "[$(date)] [run_daily.sh] Script completed successfully (via API)."
     else
         echo "[$(date)] [run_daily.sh] ERROR: Script failed (via API)!" >&2
+        run_status=1
     fi
 else
     if npm start; then
         echo "[$(date)] [run_daily.sh] Script completed successfully."
     else
         echo "[$(date)] [run_daily.sh] ERROR: Script failed!" >&2
+        run_status=1
     fi
 fi
 
 echo "[$(date)] [run_daily.sh] Script finished"
 # Lock is released automatically via trap
+exit "$run_status"
