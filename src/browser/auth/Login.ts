@@ -404,7 +404,8 @@ export class Login {
         if (signature.includes('m11.78 10.22a.75')) return 'PASSWORD'
         // Known passkey/security-key SVG signature keeps it out of the Authenticator fallback
         if (/picker_fido|passkey|fido|m18 16\.66a3\.51/.test(signature)) return 'PASSKEY'
-        if (/phone[\s_-]*app[\s_-]*otp|\btotp\b/.test(signature)) return 'TOTP'
+        // Modern authenticator-code tiles expose the phone/monitor SVG rather than a proof-type attribute.
+        if (/phone[\s_-]*app[\s_-]*otp|\btotp\b|m8\.25 9c\.97 0 1\.75\.78/.test(signature)) return 'TOTP'
         // Known Remote NGC/mobile-app SVG signature identifies Microsoft Authenticator language-independently
         if (
             /remote[\s_-]*ngc|picker_remote_ngc|phone[\s_-]*app[\s_-]*notification|push[\s_-]*notification|m15\.75 2c16\.99 2 18 3/.test(
@@ -536,13 +537,14 @@ export class Login {
                 return true
             }
 
-            // Sign in another way - prefer offered password, then Authenticator, then interactive email code
+            // Prefer an offered password, then configured TOTP, then interactive sign-in methods.
             case 'SIGN_IN_METHOD_PICKER': {
                 const options = await this.getSignInMethodOptions(page)
                 this.logAvailableSignInMethods(options)
 
                 const methods = options.map(option => ({ option, type: this.classifySignInMethod(option) }))
                 const passwordOption = methods.find(method => method.type === 'PASSWORD')?.option
+                const totpOption = methods.find(method => method.type === 'TOTP')?.option
                 const authenticatorOption = methods.find(method => method.type === 'AUTHENTICATOR')?.option
                 const emailOption = methods.find(method => method.type === 'EMAIL')?.option
 
@@ -556,6 +558,14 @@ export class Login {
                     }
 
                     await this.waitForIdle(page, 'after password method selection')
+                    return true
+                }
+
+                if (account.totpSecret && totpOption) {
+                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Selecting authenticator verification code')
+                    this.passwordlessMethodSelected = false
+                    if (!(await this.clickSignInMethodOption(page, totpOption))) return false
+                    await this.waitForIdle(page, 'after authenticator code selection')
                     return true
                 }
 
