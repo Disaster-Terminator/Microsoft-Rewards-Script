@@ -3,9 +3,9 @@ import { BING_APP_USER_AGENT } from '../../../constants/userAgents'
 import type { HttpRequestConfig } from '../../../util/Http'
 import { randomUUID } from 'crypto'
 import type { Promotion } from '../../../interface/AppDashBoardData'
-import { Workers } from '../../Workers'
+import { BaseActivity } from '../BaseActivity'
 
-export class AppReward extends Workers {
+export class AppReward extends BaseActivity {
     private gainedPoints: number = 0
 
     private oldBalance: number = this.bot.userData.currentPoints
@@ -53,7 +53,7 @@ export class AppReward extends Workers {
                     'User-Agent': BING_APP_USER_AGENT,
                     'Content-Type': 'application/json',
                     'X-Rewards-Country': this.bot.userData.geoLocale,
-                    'X-Rewards-Language': 'en',
+                    'X-Rewards-Language': this.bot.userData.langCode,
                     'X-Rewards-ismobile': 'true'
                 },
                 data: JSON.stringify(jsonData)
@@ -99,10 +99,6 @@ export class AppReward extends Workers {
                     `Completed AppReward with no points | offerId=${offerId} | pointsGained=0 | currentBalance=${newBalance}`
                 )
             }
-
-            this.bot.logger.debug(this.bot.isMobile, 'APP-REWARD', `Waiting after AppReward | offerId=${offerId}`)
-
-            await this.bot.utils.wait(this.bot.utils.randomDelay(5000, 10000))
 
             this.bot.logger.info(
                 this.bot.isMobile,

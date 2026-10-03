@@ -1,27 +1,20 @@
-function envStrFrom(sourceEnv, key) {
-    const v = sourceEnv[key]
-    if (v === undefined) return undefined
-    const t = String(v).trim()
-    return t.length ? t : undefined
+import { accountIndexesFromEnv, envStrFrom, normalizeGeoLocale, normalizeLanguageCode } from '../env.js'
+
+function sanitizeProxyUrl(value) {
+    try {
+        const url = new URL(value)
+        url.username = ''
+        url.password = ''
+        return url.toString().replace(/\/$/, '')
+    } catch {
+        return value.replace(/^(?:[^/@\s]+@|([a-z][a-z0-9+.-]*:\/\/)[^/@\s]+@)/i, '$1')
+    }
 }
 
-/**
- * Returns the configured accounts without exposing passwords, recovery
- * addresses, TOTP secrets, or proxy credentials. This API is intended for the
- * local dashboard, so account email addresses are returned in full.
- */
 export function loadAccounts(sourceEnv = process.env) {
     const accounts = []
-    const indexes = [
-        ...new Set(
-            Object.keys(sourceEnv)
-                .map(key => /^ACCOUNT_(\d+)_EMAIL$/.exec(key)?.[1])
-                .filter(Boolean)
-                .map(Number)
-        )
-    ].sort((a, b) => a - b)
 
-    for (const i of indexes) {
+    for (const i of accountIndexesFromEnv(sourceEnv)) {
         const email = envStrFrom(sourceEnv, `ACCOUNT_${i}_EMAIL`)
         if (!email) continue
 
@@ -30,15 +23,18 @@ export function loadAccounts(sourceEnv = process.env) {
             index: i,
             email,
             emailKey: email, // internal history join key; removed before returning the response
-            geoLocale: envStrFrom(sourceEnv, `ACCOUNT_${i}_GEO_LOCALE`) ?? 'auto',
-            langCode: envStrFrom(sourceEnv, `ACCOUNT_${i}_LANG_CODE`) ?? 'en',
+            geoLocale: normalizeGeoLocale(envStrFrom(sourceEnv, `ACCOUNT_${i}_GEO_LOCALE`) ?? 'auto'),
+            langCode: normalizeLanguageCode(envStrFrom(sourceEnv, `ACCOUNT_${i}_LANG_CODE`) ?? 'en'),
             hasRecoveryEmail: Boolean(envStrFrom(sourceEnv, `ACCOUNT_${i}_RECOVERY_EMAIL`)),
             hasTotp: Boolean(envStrFrom(sourceEnv, `ACCOUNT_${i}_TOTP_SECRET`)),
             proxy: proxyUrl
                 ? {
-                      url: proxyUrl,
+                      url: sanitizeProxyUrl(proxyUrl),
                       port: envStrFrom(sourceEnv, `ACCOUNT_${i}_PROXY_PORT`) ?? null,
-                      hasCredentials: Boolean(envStrFrom(sourceEnv, `ACCOUNT_${i}_PROXY_USERNAME`))
+                      hasCredentials: Boolean(
+                          envStrFrom(sourceEnv, `ACCOUNT_${i}_PROXY_USERNAME`) &&
+                          envStrFrom(sourceEnv, `ACCOUNT_${i}_PROXY_PASSWORD`)
+                      )
                   }
                 : null
         })
@@ -46,15 +42,6 @@ export function loadAccounts(sourceEnv = process.env) {
     return accounts
 }
 
-// Kept as a compatibility alias for code that imported the old function name.
-export const loadAccountsMasked = loadAccounts
-
-/**
- * Builds a child-process-only environment override that runs exactly one
- * configured account. The selected slot is remapped to ACCOUNT_1_* because the
- * bot reads account slots sequentially and stops at the first missing email.
- * No secret values leave the API process.
- */
 export function buildSingleAccountEnv(accountIndex, sourceEnv = process.env) {
     const index = Number(accountIndex)
     if (!Number.isSafeInteger(index) || index < 1) {
@@ -74,14 +61,10 @@ export function buildSingleAccountEnv(accountIndex, sourceEnv = process.env) {
 
     const env = {}
 
-    // Blank every configured account variable in the child environment first.
-    // Empty strings are treated as unset by the bot's env parser.
     for (const key of Object.keys(sourceEnv)) {
         if (/^ACCOUNT_\d+_/.test(key)) env[key] = ''
     }
 
-    // Copy the chosen slot into slot 1, including any future ACCOUNT_N_* fields
-    // not known by this API yet (password, browser settings, proxy fields, etc.).
     for (const [key, value] of selected) {
         const suffix = key.slice(selectedPrefix.length)
         env[`ACCOUNT_1_${suffix}`] = value
@@ -93,11 +76,6 @@ export function buildSingleAccountEnv(accountIndex, sourceEnv = process.env) {
     }
 }
 
-/**
- * Builds a dense child-process account environment with selected configured
- * slots excluded. Remaining slots are remapped to ACCOUNT_1..N so gaps never
- * make the bot stop discovering accounts early.
- */
 export function buildExcludedAccountsEnv(excludedAccountIndexes, sourceEnv = process.env) {
     if (!Array.isArray(excludedAccountIndexes)) {
         const err = new Error('`excludedAccountIndexes` must be an array of positive integers.')
@@ -169,6 +147,7 @@ export function mergeAccountStats(accounts, runs) {
         const results = byEmail.get(a.emailKey) || [] // already most-recent-first
         const last = results[0] || null
         const streakProtection = results.find(result => result.streakProtection != null)?.streakProtection ?? null
+        const edgeBrowsing = results.find(result => result.edgeBrowsing != null)?.edgeBrowsing ?? null
 
         let totalCollected = 0
         for (const r of results) totalCollected += r.collected || 0
@@ -191,7 +170,8 @@ export function mergeAccountStats(accounts, runs) {
             lastCollected: last?.collected ?? null,
             lastSuccess: last ? last.success : null,
             lastError: last?.error ?? null,
-            streakProtection
+            streakProtection,
+            edgeBrowsing
         }
     })
 }

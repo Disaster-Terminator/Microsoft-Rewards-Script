@@ -5,7 +5,9 @@ export interface Config {
     errorDiagnostics: boolean
     ensureStreakProtection: boolean
     autoClaimPunchcardRewards: boolean
+    contintueOnBotWarning: boolean
     skipNonPointTasks: boolean
+    accountDelay: ConfigDelay
     workers: ConfigWorkers
     activities: ConfigActivities
     searchOnBingLocalQueries: boolean
@@ -20,8 +22,6 @@ export interface Config {
 
 export type QueryEngine = 'google' | 'wikipedia' | 'wikirandom' | 'hackernews' | 'reddit' | 'local'
 
-// RSS feeds are selected with a dotted path: 'rss' (every catalogued feed),
-// 'rss.<site>' (every feed for that site), or 'rss.<site>.<endpoint>' (one feed).
 export type RssFeedSelector = 'rss' | `rss.${string}`
 export type QueryEngineEntry = QueryEngine | RssFeedSelector
 
@@ -31,6 +31,7 @@ export interface ConfigSearchSettings {
     runOnZeroPoints: boolean
     maxBonusSearches: number
     parallelSearching: boolean
+    clusterSearch: boolean
     queryEngines: QueryEngineEntry[]
     searchResultVisitTime: number | string
     searchDelay: ConfigDelay
@@ -45,10 +46,13 @@ export interface ConfigDelay {
 export interface ConfigExperimental {
     apiSearch: boolean
     apiSearchOnBing: boolean
+    blockMedia: boolean
+    edgeBrowsing: boolean
 }
 
 export interface ConfigProxy {
     queryEngine: boolean
+    ignoreCertificateErrors: boolean
 }
 
 export interface ConfigWorkers {
@@ -71,7 +75,6 @@ export interface ConfigActivities {
     searchOnBing: boolean
 }
 
-// Webhooks
 export interface ConfigWebhook {
     discord?: WebhookDiscordConfig
     ntfy?: WebhookNtfyConfig

@@ -11,6 +11,7 @@ export interface LoadedSession {
     storageState: StorageState | null
     fingerprint: BrowserFingerprintWithHeaders | null
     updatedAt: number
+    expiredCookiesRemoved: number
 }
 
 interface SessionRow {
@@ -25,13 +26,36 @@ function platformOf(isMobile: boolean): 'mobile' | 'desktop' {
     return isMobile ? 'mobile' : 'desktop'
 }
 
+function removeExpiredCookies(storageState: StorageState): {
+    storageState: StorageState
+    expiredCookiesRemoved: number
+} {
+    const now = Date.now() / 1000
+    const cookies = storageState.cookies.filter(
+        cookie => cookie.expires === -1 || !Number.isFinite(cookie.expires) || cookie.expires > now
+    )
+    const expiredCookiesRemoved = storageState.cookies.length - cookies.length
+
+    return {
+        storageState: expiredCookiesRemoved ? { ...storageState, cookies } : storageState,
+        expiredCookiesRemoved
+    }
+}
+
 function getDb(sessionPath: string): DatabaseSync {
     if (db) return db
 
     const dir = path.resolve(process.cwd(), sessionPath)
-    fs.mkdirSync(dir, { recursive: true })
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+    try {
+        fs.chmodSync(dir, 0o700)
+    } catch {}
 
-    db = new DatabaseSync(path.join(dir, 'sessions.db'))
+    const dbPath = path.join(dir, 'sessions.db')
+    db = new DatabaseSync(dbPath)
+    try {
+        fs.chmodSync(dbPath, 0o600)
+    } catch {}
 
     db.exec('PRAGMA journal_mode = WAL')
     db.exec('PRAGMA busy_timeout = 5000')
@@ -46,6 +70,13 @@ function getDb(sessionPath: string): DatabaseSync {
             PRIMARY KEY (email, platform)
         )
     `)
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS account_metadata (
+            email           TEXT PRIMARY KEY COLLATE NOCASE,
+            resolved_region TEXT,
+            updated_at      INTEGER NOT NULL
+        )
+    `)
 
     return db
 }
@@ -56,7 +87,8 @@ export function loadSession(
     isMobile: boolean,
     maxAgeMs?: number
 ): LoadedSession | null {
-    const row = getDb(sessionPath)
+    const database = getDb(sessionPath)
+    const row = database
         .prepare('SELECT storage_state, fingerprint, updated_at FROM sessions WHERE email = ? AND platform = ?')
         .get(email, platformOf(isMobile)) as SessionRow | undefined
 
@@ -66,10 +98,20 @@ export function loadSession(
         return null
     }
 
+    const storedState = row.storage_state ? (JSON.parse(row.storage_state) as StorageState) : null
+    const sanitized = storedState ? removeExpiredCookies(storedState) : { storageState: null, expiredCookiesRemoved: 0 }
+
+    if (sanitized.expiredCookiesRemoved) {
+        database
+            .prepare('UPDATE sessions SET storage_state = ? WHERE email = ? AND platform = ?')
+            .run(JSON.stringify(sanitized.storageState), email, platformOf(isMobile))
+    }
+
     return {
-        storageState: row.storage_state ? (JSON.parse(row.storage_state) as StorageState) : null,
+        storageState: sanitized.storageState,
         fingerprint: row.fingerprint ? (JSON.parse(row.fingerprint) as BrowserFingerprintWithHeaders) : null,
-        updatedAt: row.updated_at
+        updatedAt: row.updated_at,
+        expiredCookiesRemoved: sanitized.expiredCookiesRemoved
     }
 }
 
@@ -79,6 +121,8 @@ export function saveStorageState(
     isMobile: boolean,
     storageState: StorageState
 ): void {
+    const sanitized = removeExpiredCookies(storageState).storageState
+
     getDb(sessionPath)
         .prepare(
             `INSERT INTO sessions (email, platform, storage_state, updated_at)
@@ -86,7 +130,17 @@ export function saveStorageState(
              ON CONFLICT(email, platform)
              DO UPDATE SET storage_state = excluded.storage_state, updated_at = excluded.updated_at`
         )
-        .run(email, platformOf(isMobile), JSON.stringify(storageState), Date.now())
+        .run(email, platformOf(isMobile), JSON.stringify(sanitized), Date.now())
+}
+
+export function clearStorageState(sessionPath: string, email: string, isMobile: boolean): void {
+    getDb(sessionPath)
+        .prepare(
+            `UPDATE sessions
+             SET storage_state = NULL, updated_at = ?
+             WHERE email = ? AND platform = ?`
+        )
+        .run(Date.now(), email, platformOf(isMobile))
 }
 
 export function saveFingerprint(
@@ -105,9 +159,27 @@ export function saveFingerprint(
         .run(email, platformOf(isMobile), JSON.stringify(fingerprint), Date.now())
 }
 
-// Unused
-export function deleteSession(sessionPath: string, email: string, isMobile: boolean): void {
-    getDb(sessionPath).prepare('DELETE FROM sessions WHERE email = ? AND platform = ?').run(email, platformOf(isMobile))
+export function loadResolvedRegion(sessionPath: string, email: string): string | undefined {
+    const row = getDb(sessionPath)
+        .prepare('SELECT resolved_region FROM account_metadata WHERE email = ?')
+        .get(email) as { resolved_region?: string | null } | undefined
+
+    return row?.resolved_region ?? undefined
+}
+
+export function saveResolvedRegion(sessionPath: string, email: string, region: string): void {
+    if (!/^[A-Z]{2}$/.test(region)) {
+        throw new Error(`Invalid resolved account region: ${region}`)
+    }
+
+    getDb(sessionPath)
+        .prepare(
+            `INSERT INTO account_metadata (email, resolved_region, updated_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(email)
+             DO UPDATE SET resolved_region = excluded.resolved_region, updated_at = excluded.updated_at`
+        )
+        .run(email, region, Date.now())
 }
 
 export function closeSessionStore(): void {

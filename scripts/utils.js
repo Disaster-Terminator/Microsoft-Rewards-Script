@@ -2,6 +2,7 @@ import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { DatabaseSync } from 'node:sqlite'
+import { accountIndexesFromEnv, envBool, envInt, envStr, normalizeGeoLocale, normalizeLanguageCode } from './env.js'
 
 export function getDirname(importMetaUrl) {
     const __filename = fileURLToPath(importMetaUrl)
@@ -10,12 +11,21 @@ export function getDirname(importMetaUrl) {
 
 export function getProjectRoot(currentDir) {
     let dir = currentDir
+    let nearestPackageDir = null
+
     while (dir !== path.parse(dir).root) {
-        if (fs.existsSync(path.join(dir, 'package.json'))) {
-            return dir
+        const packagePath = path.join(dir, 'package.json')
+        if (fs.existsSync(packagePath)) {
+            nearestPackageDir ??= dir
+            try {
+                const pkg = JSON.parse(fs.readFileSync(packagePath, 'utf8'))
+                if (typeof pkg.name === 'string' && pkg.name.trim()) return dir
+            } catch {}
         }
         dir = path.dirname(dir)
     }
+
+    if (nearestPackageDir) return nearestPackageDir
     throw new Error('Could not find project root (package.json not found)')
 }
 
@@ -30,7 +40,7 @@ export function parseArgs(argv = process.argv.slice(2)) {
         const arg = argv[i]
 
         if (arg.startsWith('-')) {
-            const key = arg.substring(1)
+            const key = arg.replace(/^-+/, '')
 
             if (i + 1 < argv.length && !argv[i + 1].startsWith('-')) {
                 args[key] = argv[i + 1]
@@ -133,19 +143,6 @@ export function loadEnvFile(projectRoot) {
     }
 }
 
-function envStr(key) {
-    const v = process.env[key]
-    if (v === undefined) return undefined
-    const trimmed = v.trim()
-    return trimmed.length ? trimmed : undefined
-}
-
-function envBool(key, fallback) {
-    const v = envStr(key)
-    if (v === undefined) return fallback
-    return ['1', 'true', 'yes', 'on'].includes(v.toLowerCase())
-}
-
 const deprecationWarned = new Set()
 function envBoolWithLegacy(primary, legacy, fallback) {
     if (envStr(primary) !== undefined) return envBool(primary, fallback)
@@ -159,30 +156,22 @@ function envBoolWithLegacy(primary, legacy, fallback) {
     return fallback
 }
 
-function envInt(key, fallback) {
-    const v = envStr(key)
-    if (v === undefined) return fallback
-    const n = parseInt(v, 10)
-    return Number.isFinite(n) ? n : fallback
-}
-
 export function loadAccountsFromEnv(projectRoot) {
     loadEnvFile(projectRoot)
 
     const accounts = []
-    for (let i = 1; ; i++) {
-        const idx = String(i)
+    for (const index of accountIndexesFromEnv()) {
+        const idx = String(index)
         const email = envStr(`ACCOUNT_${idx}_EMAIL`)
-
-        if (!email) break
+        if (!email) continue
 
         accounts.push({
             email,
             password: envStr(`ACCOUNT_${idx}_PASSWORD`) ?? '',
             totpSecret: envStr(`ACCOUNT_${idx}_TOTP_SECRET`),
             recoveryEmail: envStr(`ACCOUNT_${idx}_RECOVERY_EMAIL`) ?? '',
-            geoLocale: envStr(`ACCOUNT_${idx}_GEO_LOCALE`) ?? 'auto',
-            langCode: envStr(`ACCOUNT_${idx}_LANG_CODE`) ?? 'en',
+            geoLocale: normalizeGeoLocale(envStr(`ACCOUNT_${idx}_GEO_LOCALE`) ?? 'auto'),
+            langCode: normalizeLanguageCode(envStr(`ACCOUNT_${idx}_LANG_CODE`) ?? 'en'),
             proxy: {
                 proxyHttp: envBoolWithLegacy(`ACCOUNT_${idx}_PROXY_HTTP`, `ACCOUNT_${idx}_PROXY_AXIOS`, false),
                 url: envStr(`ACCOUNT_${idx}_PROXY_URL`) ?? '',
@@ -208,28 +197,63 @@ export function findAccountByEmail(accounts, email) {
     )
 }
 
-export function getUserAgent(fingerprint) {
-    if (!fingerprint) return null
-    return (
-        fingerprint?.fingerprint?.navigator?.userAgent ??
-        fingerprint?.fingerprint?.userAgent ??
-        fingerprint?.userAgent ??
-        null
-    )
+const browserProxyProtocols = new Set(['http:', 'https:', 'socks4:', 'socks5:'])
+const explicitProxyProtocolPattern = /^[a-z][a-z\d+.-]*:\/\//i
+
+function parseBrowserProxyUrl(value) {
+    const input = String(value ?? '').trim()
+    if (!input) throw new Error('Proxy URL is empty')
+
+    let url
+    try {
+        url = new URL(explicitProxyProtocolPattern.test(input) ? input : `http://${input}`)
+    } catch {
+        throw new Error(`Invalid proxy URL: ${value}`)
+    }
+
+    const protocol = url.protocol.toLowerCase()
+    if (!browserProxyProtocols.has(protocol)) {
+        throw new Error(
+            `Unsupported browser proxy protocol "${protocol.slice(0, -1)}"; supported: http, https, socks4, socks5`
+        )
+    }
+    if (!url.hostname) throw new Error(`Invalid proxy URL: ${value}`)
+    return url
 }
 
 export function buildProxyConfig(account) {
-    if (!account?.proxy?.url || !account.proxy.port) {
+    const settings = account?.proxy
+    if (!settings?.url) {
+        if (settings && (settings.proxyHttp || settings.port || settings.username || settings.password)) {
+            throw new Error('Proxy URL is required when other proxy settings are configured')
+        }
         return null
     }
 
-    const proxy = {
-        server: `${account.proxy.url}:${account.proxy.port}`
+    if (!Number.isInteger(settings.port) || settings.port < 1 || settings.port > 65535) {
+        throw new Error('Proxy port must be an integer from 1 to 65535')
     }
 
-    if (account.proxy.username && account.proxy.password) {
-        proxy.username = account.proxy.username
-        proxy.password = account.proxy.password
+    const url = parseBrowserProxyUrl(settings.url)
+    if (url.username || url.password) {
+        throw new Error('Put proxy credentials in ACCOUNT_N_PROXY_USERNAME/PASSWORD, not in ACCOUNT_N_PROXY_URL')
+    }
+
+    const hasUsername = Boolean(settings.username)
+    const hasPassword = Boolean(settings.password)
+    if (hasUsername !== hasPassword) {
+        throw new Error('Proxy username and password must be configured together')
+    }
+    if ((url.protocol === 'socks4:' || url.protocol === 'socks5:') && (hasUsername || hasPassword)) {
+        throw new Error(
+            `${url.protocol.slice(0, -1).toUpperCase()} proxy authentication is not supported by Patchright`
+        )
+    }
+
+    const proxy = { server: `${url.protocol}//${url.hostname}:${settings.port}` }
+    if (hasUsername && hasPassword) {
+        proxy.username = settings.username
+        proxy.password = settings.password
     }
 
     return proxy
@@ -262,7 +286,9 @@ export function getSessionDbPath(projectRoot, sessionPath) {
 }
 
 export function openSessionDb(dbPath, { readonly = false } = {}) {
-    return new DatabaseSync(dbPath, { readOnly: readonly })
+    const db = new DatabaseSync(dbPath, { readOnly: readonly })
+    db.exec('PRAGMA busy_timeout = 5000')
+    return db
 }
 
 export function closeSessionDb(db) {
@@ -293,6 +319,14 @@ export function clearSessionRows(db, email) {
     const info = email
         ? db.prepare('DELETE FROM sessions WHERE LOWER(email) = LOWER(?)').run(email)
         : db.prepare('DELETE FROM sessions').run()
+
+    try {
+        if (email) {
+            db.prepare('DELETE FROM account_metadata WHERE LOWER(email) = LOWER(?)').run(email)
+        } else {
+            db.prepare('DELETE FROM account_metadata').run()
+        }
+    } catch {}
 
     try {
         db.exec('PRAGMA wal_checkpoint(TRUNCATE)')

@@ -14,14 +14,14 @@ import type { PageSnapshot } from './browser/ReactFunc'
 import { IpcLog, Logger } from './logging/Logger'
 import Utils, { isBrowserClosedError } from './util/Utils'
 import { loadAccounts, loadConfig } from './util/Load'
-import { closeSessionStore } from './util/SessionStore'
+import { closeSessionStore, loadResolvedRegion, saveResolvedRegion } from './util/SessionStore'
 import { checkNodeVersion } from './util/Validator'
+import { normalizeCountry, resolveAccountLocale } from './util/Locale'
+import type { AccountLocale } from './util/Locale'
 
 import { Login } from './browser/auth/Login'
-import { Workers } from './functions/Workers'
 import Activities from './functions/Activities'
-import { SearchManager } from './functions/SearchManager'
-import { PunchcardManager } from './functions/PunchcardManager'
+import { SearchManager } from './functions/activities/search/SearchManager'
 
 import type { Account } from './interface/Account'
 import HttpClient from './util/Http'
@@ -30,6 +30,7 @@ import { sendNtfy, flushNtfyQueue } from './logging/Ntfy'
 import { sendTelegram, flushTelegramQueue } from './logging/Telegram'
 import type { DashboardData } from './interface/DashboardData'
 import type { AppDashboardData } from './interface/AppDashBoardData'
+import type { AppEarnablePoints } from './interface/Points'
 
 interface ExecutionContext {
     isMobile: boolean
@@ -53,6 +54,12 @@ interface AccountStats {
 
 function accountRunExitCode(stats: AccountStats[]): number {
     return stats.some(account => !account.success) ? 1 : 0
+}
+
+interface AccountRunResult {
+    initialPoints: number
+    collectedPoints: number
+    skippedForBotWarning?: boolean
 }
 
 const executionContext = new AsyncLocalStorage<ExecutionContext>()
@@ -91,10 +98,16 @@ export class MicrosoftRewardsBot {
     public mainDesktopPage!: Page
 
     public userData: UserData
+    public accountLocale: AccountLocale
 
     public nextActions: Record<string, string> = {}
     public nextRouterStateTree = ''
     public reactSnapshot: PageSnapshot | null = null
+    public reactSnapshots: { mobile: PageSnapshot | null; desktop: PageSnapshot | null } = {
+        mobile: null,
+        desktop: null
+    }
+    public searchTopicsCache: { key: string; topics: Promise<string[]> } | null = null
 
     public accessToken = ''
     public cookies: { mobile: Cookie[]; desktop: Cookie[] }
@@ -110,9 +123,7 @@ export class MicrosoftRewardsBot {
     private exitedWorkers: number[]
     private browserFactory: Browser = new Browser(this)
     private accounts: Account[]
-    public workers: Workers
     private searchManager: SearchManager
-    private punchcardManager: PunchcardManager
     private login = new Login(this)
 
     public http!: HttpClient
@@ -127,13 +138,12 @@ export class MicrosoftRewardsBot {
             currentPoints: 0,
             gainedPoints: 0
         }
+        this.accountLocale = resolveAccountLocale({ langCode: 'en', geoLocale: 'US' })
         this.logger = new Logger(this)
         this.accounts = []
         this.cookies = { mobile: [], desktop: [] }
         this.utils = new Utils()
-        this.workers = new Workers(this)
         this.searchManager = new SearchManager(this)
-        this.punchcardManager = new PunchcardManager(this)
         this.browser = {
             func: new BrowserFunc(this),
             utils: new BrowserUtils(this),
@@ -152,27 +162,108 @@ export class MicrosoftRewardsBot {
         return getCurrentContext().account?.email || null
     }
 
+    async refreshCurrentRewardsContext(reason: string): Promise<boolean> {
+        const context = getCurrentContext()
+        const account = context.account
+        let page = context.isMobile ? this.mainMobilePage : this.mainDesktopPage
+        let recoverySession: BrowserSession | null = null
+        let refreshSucceeded = false
+
+        if (!account?.email) {
+            this.logger.debug(
+                this.isMobile,
+                'CONTEXT-REFRESH',
+                `Cannot refresh rewards context | reason=${reason} | account=unavailable`
+            )
+            return false
+        }
+
+        try {
+            this.logger.warn(
+                this.isMobile,
+                'CONTEXT-REFRESH',
+                `Refreshing rewards browser context after request failure | reason=${reason}`
+            )
+
+            if (!page || page.isClosed()) {
+                recoverySession = await this.browserFactory.createBrowser(account)
+                page = await recoverySession.context.newPage()
+                if (context.isMobile) {
+                    this.mainMobilePage = page
+                    this.fingerprintMobile = recoverySession.fingerprint
+                } else {
+                    this.mainDesktopPage = page
+                    this.fingerprintDesktop = recoverySession.fingerprint
+                }
+
+                await this.login.login(page, account)
+            } else {
+                this.nextActions = {}
+                this.nextRouterStateTree = ''
+                this.reactSnapshot = null
+                await this.browser.func.synchronizeActiveBrowserCookies('CONTEXT-REFRESH-COOKIE-SEED', true)
+                try {
+                    await this.browser.func.bootstrap(page)
+                } catch {
+                    await this.login.login(page, account)
+                }
+            }
+
+            await this.browser.func.checkpointActiveSession('CONTEXT-REFRESH')
+
+            const refreshedCookies = await page.context().cookies()
+            this.logger.info(
+                this.isMobile,
+                'CONTEXT-REFRESH',
+                `Rewards context refreshed successfully | cookies=${refreshedCookies.length}`,
+                'green'
+            )
+            refreshSucceeded = true
+            return true
+        } catch (error) {
+            this.logger.error(
+                this.isMobile,
+                'CONTEXT-REFRESH',
+                `Rewards context refresh failed | reason=${reason} | message=${error instanceof Error ? error.message : String(error)}`
+            )
+            return false
+        } finally {
+            if (recoverySession) {
+                await this.browser.func.closeBrowser(recoverySession.context, account.email, refreshSucceeded)
+            }
+        }
+    }
+
     async initialize(): Promise<void> {
         this.accounts = loadAccounts()
         this.warnExperimental()
     }
 
-    // Move to utils
     private warnExperimental(): void {
         const exp = this.config.experimental
-        const enabled = [exp.apiSearch && 'apiSearch', exp.apiSearchOnBing && 'apiSearchOnBing'].filter(
+        const searchFeatures = [exp.apiSearch && 'apiSearch', exp.apiSearchOnBing && 'apiSearchOnBing'].filter(
             Boolean
         ) as string[]
-        if (!enabled.length) return
 
-        this.logger.warn(
-            'main',
-            'EXPERIMENTAL',
-            `${enabled.join(' + ')} enabled - these perform searches over HTTP with no real browser. ` +
-                `This path is EXPERIMENTAL and UNSAFE and may get your account flagged or banned. ` +
-                `Disable it under config.experimental if you are unsure.`,
-            'redBright'
-        )
+        if (searchFeatures.length) {
+            this.logger.warn(
+                'main',
+                'EXPERIMENTAL',
+                `${searchFeatures.join(' + ')} enabled - these perform searches over HTTP with no real browser. ` +
+                    `This path is EXPERIMENTAL and UNSAFE and may get your account flagged or banned. ` +
+                    `Disable it under config.experimental if you are unsure.`,
+                'redBright'
+            )
+        }
+
+        if (exp.edgeBrowsing) {
+            this.logger.warn(
+                'main',
+                'EXPERIMENTAL',
+                'edgeBrowsing enabled - the Edge browsing activity will be reported over HTTP in the background. ' +
+                    'This integration is experimental; disable it under config.experimental if it behaves unexpectedly.'
+            )
+        }
     }
 
     async run(): Promise<void> {
@@ -206,7 +297,11 @@ export class MicrosoftRewardsBot {
         const allAccountStats: AccountStats[] = []
         let hadWorkerFailure = false
 
-        for (const chunk of accountChunks) {
+        for (const [chunkIndex, chunk] of accountChunks.entries()) {
+            if (chunkIndex > 0) {
+                await this.waitBeforeNextAccount(chunk[0]?.email)
+            }
+
             const worker = cluster.fork()
             worker.send?.({ chunk, runStartTime })
 
@@ -231,11 +326,6 @@ export class MicrosoftRewardsBot {
                     }
                 }
             })
-
-            // Startup delay for clusters due to resource usage
-            if (accountChunks.indexOf(chunk) !== accountChunks.length - 1) {
-                await this.utils.wait(5000)
-            }
         }
 
         const onWorkerExit = async (worker: Worker, code?: number, signal?: string): Promise<void> => {
@@ -325,25 +415,36 @@ export class MicrosoftRewardsBot {
     private async runTasks(accounts: Account[], runStartTime: number): Promise<AccountStats[]> {
         const accountStats: AccountStats[] = []
 
-        for (const account of accounts) {
+        for (const [accountIndex, account] of accounts.entries()) {
+            if (accountIndex > 0) {
+                await this.waitBeforeNextAccount(account.email)
+            }
+
             const accountStartTime = Date.now()
             const accountEmail = account.email
             this.userData.userName = this.utils.getEmailUsername(accountEmail)
             this.userData.timezoneOffset = String(new Date().getTimezoneOffset())
-            this.userData.langCode = account.langCode ?? 'en'
 
             try {
+                const cachedRegion =
+                    account.geoLocale === 'auto' ? loadResolvedRegion(this.config.sessionPath, accountEmail) : undefined
+                this.accountLocale = resolveAccountLocale(account, cachedRegion)
+                this.userData.langCode = this.accountLocale.language
+                this.userData.geoLocale = this.accountLocale.country ?? 'US'
+
                 this.logger.info(
                     'main',
                     'ACCOUNT-START',
-                    `Starting account: ${accountEmail} | geoLocale: ${account.geoLocale}`
+                    `Starting account: ${accountEmail} | geoLocale: ${account.geoLocale} | locale: ${this.accountLocale.locale}${
+                        cachedRegion ? ` | cachedRegion: ${cachedRegion}` : ''
+                    }`
                 )
 
-                this.http = new HttpClient(account.proxy)
+                this.http = new HttpClient(account.proxy, {
+                    'Accept-Language': this.accountLocale.acceptLanguage
+                })
 
-                const result: { initialPoints: number; collectedPoints: number } | undefined = await this.Main(
-                    account
-                ).catch(error => {
+                const result: AccountRunResult | undefined = await this.Main(account).catch(error => {
                     void this.logger.error(
                         true,
                         'FLOW',
@@ -359,21 +460,39 @@ export class MicrosoftRewardsBot {
                     const accountInitialPoints = result.initialPoints ?? 0
                     const accountFinalPoints = accountInitialPoints + collectedPoints
 
-                    accountStats.push({
-                        email: accountEmail,
-                        initialPoints: accountInitialPoints,
-                        finalPoints: accountFinalPoints,
-                        collectedPoints: collectedPoints,
-                        duration: parseFloat(durationSeconds),
-                        success: true
-                    })
+                    if (result.skippedForBotWarning) {
+                        accountStats.push({
+                            email: accountEmail,
+                            initialPoints: accountInitialPoints,
+                            finalPoints: accountInitialPoints,
+                            collectedPoints: 0,
+                            duration: parseFloat(durationSeconds),
+                            success: false,
+                            error: 'Microsoft bot-score warning detected'
+                        })
 
-                    this.logger.info(
-                        'main',
-                        'ACCOUNT-END',
-                        `Completed account: ${accountEmail} | pointsGained=${collectedPoints} | previousBalance=${accountInitialPoints} | currentBalance=${accountFinalPoints} | durationSeconds=${durationSeconds}`,
-                        'green'
-                    )
+                        this.logger.warn(
+                            'main',
+                            'ACCOUNT-SKIP',
+                            `Skipped account: ${accountEmail} | reason=Fraud_UserWarning_BotScore_UX | durationSeconds=${durationSeconds}`
+                        )
+                    } else {
+                        accountStats.push({
+                            email: accountEmail,
+                            initialPoints: accountInitialPoints,
+                            finalPoints: accountFinalPoints,
+                            collectedPoints: collectedPoints,
+                            duration: parseFloat(durationSeconds),
+                            success: true
+                        })
+
+                        this.logger.info(
+                            'main',
+                            'ACCOUNT-END',
+                            `Completed account: ${accountEmail} | pointsGained=${collectedPoints} | previousBalance=${accountInitialPoints} | currentBalance=${accountFinalPoints} | durationSeconds=${durationSeconds}`,
+                            'green'
+                        )
+                    }
                 } else {
                     accountStats.push({
                         email: accountEmail,
@@ -427,6 +546,26 @@ export class MicrosoftRewardsBot {
         return accountStats
     }
 
+    private async waitBeforeNextAccount(nextEmail?: string): Promise<void> {
+        const { min, max } = this.config.accountDelay
+        const minMs = typeof min === 'number' ? min : this.utils.stringToNumber(min)
+        const maxMs = typeof max === 'number' ? max : this.utils.stringToNumber(max)
+
+        if (minMs < 0 || maxMs < 0 || maxMs < minMs) {
+            throw new Error('accountDelay must use non-negative values with max greater than or equal to min')
+        }
+
+        const delayMs = this.utils.randomNumber(Math.ceil(minMs), Math.floor(maxMs))
+        this.logger.info(
+            'main',
+            'ACCOUNT-DELAY',
+            `Waiting ${(delayMs / 1000).toFixed(1)} seconds before starting the next account${
+                nextEmail ? ` (${nextEmail})` : ''
+            }`
+        )
+        await this.utils.wait(delayMs)
+    }
+
     async createDesktopSession(account: Account): Promise<BrowserSession> {
         const session = await this.browserFactory.createBrowser(account)
         this.mainDesktopPage = await session.context.newPage()
@@ -435,21 +574,60 @@ export class MicrosoftRewardsBot {
         this.logger.info(this.isMobile, 'BROWSER', `Desktop Browser started | ${account.email}`)
 
         await this.login.login(this.mainDesktopPage, account)
+        await this.browser.func.checkpointActiveSession('LOGIN-CHECKPOINT')
         this.cookies.desktop = await session.context.cookies()
 
         return session
     }
 
-    async Main(account: Account): Promise<{ initialPoints: number; collectedPoints: number }> {
+    async Main(account: Account): Promise<AccountRunResult> {
         const accountEmail = account.email
         this.logger.info('main', 'FLOW', `Starting session for ${accountEmail}`)
 
-        // Drop cookies from previous account
-        this.browser.func.resetHttpJars()
+        this.accessToken = ''
+        this.cookies = { mobile: [], desktop: [] }
+        this.fingerprintMobile = undefined
+        this.fingerprintDesktop = undefined
+        this.reactSnapshot = null
+        this.reactSnapshots = { mobile: null, desktop: null }
+        this.searchTopicsCache = null
+
+        const apiSearch = this.config.experimental.apiSearch
+        const apiSearchOnBing = this.config.experimental.apiSearchOnBing
+        const fullApi = apiSearch && (apiSearchOnBing || !this.config.activities.searchOnBing)
+        const needsAppActivities =
+            this.config.workers.doDailyCheckIn ||
+            this.config.workers.doAppPromotions ||
+            this.config.workers.doReadToEarn
+        const needsAppAccessToken = this.config.experimental.edgeBrowsing || needsAppActivities
 
         let mobileSession: BrowserSession | null = null
-        let mobileContextClosed = false
         let desktopSession: BrowserSession | null = null
+        const edgeBrowsingController = new AbortController()
+        let edgeBrowsingTask: Promise<void> | null = null
+        let edgeBrowsingFinished = false
+
+        const closeMobileSession = async (): Promise<void> => {
+            const session = mobileSession
+            if (!session) return
+            mobileSession = null
+
+            await executionContext.run({ isMobile: true, account }, async () => {
+                await this.browser.func.checkpointActiveSession('PRE-BROWSER-CLOSE')
+                await this.browser.func.closeBrowser(session.context, accountEmail)
+            })
+        }
+
+        const closeDesktopSession = async (): Promise<void> => {
+            const session = desktopSession
+            if (!session) return
+            desktopSession = null
+
+            await executionContext.run({ isMobile: false, account }, async () => {
+                await this.browser.func.checkpointActiveSession('PRE-BROWSER-CLOSE')
+                await this.browser.func.closeBrowser(session.context, accountEmail)
+            })
+        }
 
         try {
             return await executionContext.run({ isMobile: true, account }, async () => {
@@ -461,98 +639,190 @@ export class MicrosoftRewardsBot {
 
                 await this.login.login(this.mainMobilePage, account)
 
-                try {
-                    this.accessToken = await this.login.getAppAccessToken(this.mainMobilePage, accountEmail)
-                } catch (error) {
-                    this.logger.error(
-                        'main',
-                        'FLOW',
-                        `Failed to get mobile access token: ${error instanceof Error ? error.message : String(error)}`
-                    )
+                if (needsAppAccessToken) {
+                    try {
+                        this.accessToken = await this.login.getAppAccessToken(this.mainMobilePage, accountEmail)
+                    } catch (error) {
+                        this.logger.error(
+                            'main',
+                            'FLOW',
+                            `Failed to get mobile access token: ${error instanceof Error ? error.message : String(error)}`
+                        )
+                        this.accessToken = ''
+                    }
                 }
 
+                await this.browser.func.checkpointActiveSession('LOGIN-CHECKPOINT')
                 this.cookies.mobile = await initialContext.cookies()
                 this.fingerprintMobile = mobileSession.fingerprint
 
-                const data: DashboardData = await this.browser.func.getDashboardData()
-                const appData: AppDashboardData = await this.browser.func.getAppDashboardData()
-                void appData
+                if (fullApi) {
+                    await closeMobileSession()
+                    this.logger.info(
+                        'main',
+                        'FLOW',
+                        'Mobile login browser closed; continuing with the saved session and HTTP requests'
+                    )
+                }
 
-                this.userData.geoLocale =
-                    account.geoLocale === 'auto'
-                        ? data.dashboard.userProfile.attributes.country
-                        : account.geoLocale.toLowerCase()
-                if (this.userData.geoLocale.length > 2) {
+                const data: DashboardData = await this.browser.func.getDashboardData()
+                const hasBotScoreWarning =
+                    Array.isArray(data.dashboard.userWarnings) &&
+                    data.dashboard.userWarnings.some(warning => warning?.name === 'Fraud_UserWarning_BotScore_UX')
+
+                if (hasBotScoreWarning) {
+                    const availablePoints = data.dashboard.userStatus.availablePoints ?? 0
+
+                    if (!this.config.contintueOnBotWarning) {
+                        this.logger.warn(
+                            'main',
+                            'BOT-WARNING',
+                            `Microsoft Rewards reported Fraud_UserWarning_BotScore_UX for ${accountEmail}. ` +
+                                'This account will be skipped for safety. The preferred action is to stop automation for this account and wait a few days. ' +
+                                'To continue anyway (not recommended), set "contintueOnBotWarning": true.'
+                        )
+
+                        return {
+                            initialPoints: availablePoints,
+                            collectedPoints: 0,
+                            skippedForBotWarning: true
+                        }
+                    }
+
                     this.logger.warn(
                         'main',
-                        'GEO-LOCALE',
-                        `The provided geoLocale is longer than 2 (${this.userData.geoLocale} | auto=${account.geoLocale === 'auto'}), this is likely invalid and can cause errors!`
+                        'BOT-WARNING',
+                        `Microsoft Rewards reported Fraud_UserWarning_BotScore_UX for ${accountEmail}, but contintueOnBotWarning=true. ` +
+                            'Continuing as configured is not recommended; waiting a few days is the preferred action.'
                     )
+                }
+
+                const profileCountry = normalizeCountry(data.dashboard.userProfile.attributes.country)
+
+                if (account.geoLocale === 'auto') {
+                    if (profileCountry) {
+                        saveResolvedRegion(this.config.sessionPath, accountEmail, profileCountry)
+                    } else {
+                        this.logger.warn(
+                            'main',
+                            'GEO-LOCALE',
+                            `Microsoft profile returned an invalid country; retaining ${
+                                this.accountLocale.country ?? 'US fallback'
+                            }`
+                        )
+                    }
+                }
+
+                this.accountLocale = resolveAccountLocale(account, profileCountry ?? this.accountLocale.country)
+                this.userData.langCode = this.accountLocale.language
+                this.userData.geoLocale = this.accountLocale.country ?? 'US'
+                this.http.setDefaultHeaders({
+                    'Accept-Language': this.accountLocale.acceptLanguage
+                })
+
+                let appData: AppDashboardData | null = null
+
+                if (this.accessToken && needsAppActivities) {
+                    try {
+                        appData = await this.browser.func.getAppDashboardData()
+                    } catch (error) {
+                        this.logger.warn(
+                            'main',
+                            'LOGIN-APP',
+                            `App dashboard unavailable - app activities will be skipped this run | message=${error instanceof Error ? error.message : String(error)}`
+                        )
+                        this.accessToken = ''
+                    }
                 }
 
                 this.userData.initialPoints = data.dashboard.userStatus.availablePoints
                 this.userData.currentPoints = data.dashboard.userStatus.availablePoints
                 const initialPoints = this.userData.initialPoints ?? 0
 
-                const browserEarnable = await this.browser.func.getBrowserEarnablePoints()
-                const appEarnable = await this.browser.func.getAppEarnablePoints()
+                const browserEarnable = await this.browser.func.getBrowserEarnablePoints(data)
+                let appEarnable: AppEarnablePoints | null = null
 
-                const pointsCanCollect = browserEarnable.mobileSearchPoints + (appEarnable?.totalEarnablePoints ?? 0)
+                if (this.accessToken && needsAppActivities) {
+                    try {
+                        appEarnable = await this.browser.func.getAppEarnablePoints()
+                    } catch (error) {
+                        this.logger.warn(
+                            'main',
+                            'LOGIN-APP',
+                            `App earnable-points lookup failed - app activities will be skipped this run | message=${error instanceof Error ? error.message : String(error)}`
+                        )
+                        this.accessToken = ''
+                        appData = null
+                    }
+                }
+
+                const appAvailable = Boolean(this.accessToken && appData)
 
                 this.logger.info(
                     'main',
                     'POINTS',
-                    `Earnable today | Mobile: ${pointsCanCollect} | Browser: ${
-                        browserEarnable.mobileSearchPoints
-                    } | App: ${appEarnable?.totalEarnablePoints ?? 0} | ${accountEmail} | locale: ${this.userData.geoLocale}`
+                    `Earnable today | Mobile: ${browserEarnable.mobileSearchPoints} | Browser: ${
+                        browserEarnable.desktopSearchPoints
+                    } | App: ${appEarnable?.totalEarnablePoints ?? 0} | ${accountEmail} | locale: ${this.accountLocale.locale}`
                 )
 
-                const apiSearch = this.config.experimental.apiSearch
-                const apiSearchOnBing = this.config.experimental.apiSearchOnBing
                 const parallel = this.config.searchSettings.parallelSearching
                 const doBonus = this.config.workers.doBonusSearches
                 const doVisualSearch = this.config.workers.doVisualSearch
-
-                const fullApi = apiSearch && (apiSearchOnBing || !this.config.activities.searchOnBing)
 
                 let mobilePoints = 0
                 let desktopPoints = 0
                 let bonusPoints = 0
 
+                if (this.config.experimental.edgeBrowsing) {
+                    edgeBrowsingTask = this.activities
+                        .doEdgeBrowsing(data, edgeBrowsingController.signal)
+                        .catch(error => {
+                            this.logger.error(
+                                this.isMobile,
+                                'EDGE-BROWSING',
+                                `Unexpected background task failure | message=${
+                                    error instanceof Error ? error.message : String(error)
+                                }`
+                            )
+                        })
+                        .finally(() => {
+                            edgeBrowsingFinished = true
+                        })
+                }
+
                 if (fullApi) {
                     if (this.config.ensureStreakProtection) {
                         await this.activities.doEnsureStreakProtection()
                     }
-                    if (this.config.workers.doPunchCards) await this.punchcardManager.runMobile(data)
+                    if (this.config.workers.doPunchCards) await this.activities.doPunchCardsMobile(data)
                     if (this.config.workers.doActivateSearchPerk) await this.activities.doActivateSearchPerk(data)
 
                     const plan = await this.searchManager.getSearchPoints()
                     const doMobileSearch = plan.doMobile
                     const doDesktopSearch = plan.doDesktop
-                    const desktopNeeded = this.config.workers.doPunchCards || doDesktopSearch || doVisualSearch
+                    const desktopBrowserNeeded = this.config.workers.doPunchCards || doVisualSearch
 
-                    this.cookies.mobile = await initialContext.cookies()
-                    await this.browser.func.closeBrowser(initialContext, accountEmail)
-                    mobileContextClosed = true
-
-                    if (desktopNeeded) {
-                        await executionContext.run({ isMobile: false, account }, async () => {
-                            desktopSession = await this.createDesktopSession(account)
-                            await this.punchcardManager.runDesktop()
-                            if (doVisualSearch) await this.activities.doVisualSearch(data)
-                        })
-
-                        await executionContext.run({ isMobile: false, account }, async () => {
-                            await this.browser.func.closeBrowser(desktopSession!.context, accountEmail)
-                        })
-                        desktopSession = null
+                    if (doDesktopSearch && !desktopBrowserNeeded) {
+                        this.cookies.desktop = [...this.cookies.mobile]
+                        this.fingerprintDesktop = await this.browserFactory.generateFingerprint(false)
                     }
 
-                    if (this.config.workers.doDailySet) await this.workers.doDailySet(data)
-                    if (this.config.workers.doMorePromotions) await this.workers.doMorePromotions(data)
-                    if (this.config.workers.doDailyCheckIn) await this.activities.doDailyCheckIn()
-                    if (this.config.workers.doAppPromotions) await this.workers.doAppPromotions(appData)
-                    if (this.config.workers.doReadToEarn) await this.activities.doReadToEarn()
+                    if (desktopBrowserNeeded) {
+                        await executionContext.run({ isMobile: false, account }, async () => {
+                            desktopSession = await this.createDesktopSession(account)
+                            if (this.config.workers.doPunchCards) await this.activities.doPunchCardsDesktop()
+                            if (doVisualSearch) await this.activities.doVisualSearch(data)
+                        })
+                        await closeDesktopSession()
+                    }
+
+                    if (this.config.workers.doDailySet) await this.activities.doDailySet(data)
+                    if (this.config.workers.doMorePromotions) await this.activities.doMorePromotions(data)
+                    if (appAvailable && this.config.workers.doDailyCheckIn) await this.activities.doDailyCheckIn()
+                    if (appAvailable && this.config.workers.doAppPromotions && appData)
+                        await this.activities.doAppPromotions(appData)
+                    if (appAvailable && this.config.workers.doReadToEarn) await this.activities.doReadToEarn()
 
                     if (doMobileSearch) mobilePoints = await this.searchManager.searchMobile(account)
                     if (doBonus) bonusPoints = await this.searchManager.bonusMobile(account)
@@ -561,82 +831,75 @@ export class MicrosoftRewardsBot {
                     if (this.config.ensureStreakProtection) {
                         await this.activities.doEnsureStreakProtection()
                     }
-                    if (this.config.workers.doDailySet) await this.workers.doDailySet(data)
+                    if (this.config.workers.doDailySet) await this.activities.doDailySet(data)
                     if (this.config.workers.doActivateSearchPerk) await this.activities.doActivateSearchPerk(data)
-                    if (this.config.workers.doMorePromotions) await this.workers.doMorePromotions(data)
-                    if (this.config.workers.doDailyCheckIn) await this.activities.doDailyCheckIn()
-                    if (this.config.workers.doAppPromotions) await this.workers.doAppPromotions(appData)
-                    if (this.config.workers.doReadToEarn) await this.activities.doReadToEarn()
-                    if (this.config.workers.doPunchCards) await this.punchcardManager.runMobile(data)
+                    if (this.config.workers.doMorePromotions) await this.activities.doMorePromotions(data)
+                    if (appAvailable && this.config.workers.doDailyCheckIn) await this.activities.doDailyCheckIn()
+                    if (appAvailable && this.config.workers.doAppPromotions && appData)
+                        await this.activities.doAppPromotions(appData)
+                    if (appAvailable && this.config.workers.doReadToEarn) await this.activities.doReadToEarn()
+                    if (this.config.workers.doPunchCards) await this.activities.doPunchCardsMobile(data)
 
                     const plan = await this.searchManager.getSearchPoints()
                     const doMobileSearch = plan.doMobile
                     const doDesktopSearch = plan.doDesktop
 
-                    const desktopNeeded = this.config.workers.doPunchCards || doDesktopSearch || doVisualSearch
+                    const desktopBrowserNeeded =
+                        this.config.workers.doPunchCards || doVisualSearch || (doDesktopSearch && !apiSearch)
+
+                    if (apiSearch && doDesktopSearch && !desktopBrowserNeeded) {
+                        this.cookies.desktop = [...this.cookies.mobile]
+                        this.fingerprintDesktop = await this.browserFactory.generateFingerprint(false)
+                    }
 
                     if (parallel && !apiSearch && doMobileSearch && doDesktopSearch) {
-                        if (desktopNeeded) {
-                            await executionContext.run({ isMobile: false, account }, async () => {
-                                desktopSession = await this.createDesktopSession(account)
-                                await this.punchcardManager.runDesktop()
-                                if (doVisualSearch) await this.activities.doVisualSearch(data)
-                            })
+                        await executionContext.run({ isMobile: false, account }, async () => {
+                            desktopSession = await this.createDesktopSession(account)
+                            if (this.config.workers.doPunchCards) await this.activities.doPunchCardsDesktop()
+                            if (doVisualSearch) await this.activities.doVisualSearch(data)
+                        })
+
+                        const mobileWork = async (): Promise<[number, number]> => {
+                            try {
+                                const searchPoints = await this.searchManager.searchMobile(account)
+                                const extraPoints = doBonus ? await this.searchManager.bonusMobile(account) : 0
+                                return [searchPoints, extraPoints]
+                            } finally {
+                                await closeMobileSession()
+                            }
+                        }
+                        const desktopWork = async (): Promise<number> => {
+                            try {
+                                return await this.searchManager.searchDesktop(account)
+                            } finally {
+                                await closeDesktopSession()
+                            }
                         }
 
-                        ;[mobilePoints, desktopPoints] = await Promise.all([
-                            this.searchManager.searchMobile(account),
-                            this.searchManager.searchDesktop(account)
-                        ])
+                        ;[[mobilePoints, bonusPoints], desktopPoints] = await Promise.all([mobileWork(), desktopWork()])
+                    } else {
+                        if (apiSearch) await closeMobileSession()
 
+                        if (doMobileSearch) mobilePoints = await this.searchManager.searchMobile(account)
                         if (doBonus) bonusPoints = await this.searchManager.bonusMobile(account)
 
-                        this.cookies.mobile = await initialContext.cookies()
-                        await this.browser.func.closeBrowser(initialContext, accountEmail)
-                        mobileContextClosed = true
+                        if (!apiSearch) await closeMobileSession()
 
-                        if (desktopSession) {
-                            await executionContext.run({ isMobile: false, account }, async () => {
-                                await this.browser.func.closeBrowser(desktopSession!.context, accountEmail)
-                            })
-                            desktopSession = null
-                        }
-                    } else {
-                        if (apiSearch) {
-                            this.cookies.mobile = await initialContext.cookies()
-                            await this.browser.func.closeBrowser(initialContext, accountEmail)
-                            mobileContextClosed = true
-
-                            if (doMobileSearch) mobilePoints = await this.searchManager.searchMobile(account)
-                            if (doBonus) bonusPoints = await this.searchManager.bonusMobile(account)
-                        } else {
-                            if (doMobileSearch) mobilePoints = await this.searchManager.searchMobile(account)
-                            if (doBonus) bonusPoints = await this.searchManager.bonusMobile(account)
-
-                            this.cookies.mobile = await initialContext.cookies()
-                            await this.browser.func.closeBrowser(initialContext, accountEmail)
-                            mobileContextClosed = true
-                        }
-
-                        if (desktopNeeded) {
+                        if (desktopBrowserNeeded) {
                             await executionContext.run({ isMobile: false, account }, async () => {
                                 desktopSession = await this.createDesktopSession(account)
 
-                                await this.punchcardManager.runDesktop()
+                                if (this.config.workers.doPunchCards) await this.activities.doPunchCardsDesktop()
                                 if (doVisualSearch) await this.activities.doVisualSearch(data)
                                 if (doDesktopSearch && !apiSearch) {
                                     desktopPoints = await this.searchManager.searchDesktop(account)
                                 }
                             })
+                            await closeDesktopSession()
+                        }
 
-                            await executionContext.run({ isMobile: false, account }, async () => {
-                                await this.browser.func.closeBrowser(desktopSession!.context, accountEmail)
-                            })
-                            desktopSession = null
-
-                            if (doDesktopSearch && apiSearch) {
-                                desktopPoints = await this.searchManager.searchDesktop(account)
-                            }
+                        if (doDesktopSearch && apiSearch) {
+                            desktopPoints = await this.searchManager.searchDesktop(account)
                         }
                     }
                 }
@@ -649,7 +912,19 @@ export class MicrosoftRewardsBot {
                     }`
                 )
 
-                if (this.config.workers.doClaimBonusPoints) await this.workers.doClaimBonusPoints()
+                if (this.config.workers.doClaimBonusPoints) await this.activities.doClaimBonusPoints()
+
+                if (edgeBrowsingTask) {
+                    if (!edgeBrowsingFinished) {
+                        this.logger.info(
+                            this.isMobile,
+                            'EDGE-BROWSING',
+                            'Foreground activities finished; waiting for the background Edge browsing activity'
+                        )
+                    }
+                    await edgeBrowsingTask
+                    edgeBrowsingTask = null
+                }
 
                 const finalPoints = await this.browser.func.getCurrentPoints()
                 const collectedPoints = finalPoints - initialPoints
@@ -666,11 +941,15 @@ export class MicrosoftRewardsBot {
                 }
             })
         } finally {
-            if (mobileSession && !mobileContextClosed) {
+            if (edgeBrowsingTask) {
+                edgeBrowsingController.abort()
+                await edgeBrowsingTask
+                edgeBrowsingTask = null
+            }
+
+            if (mobileSession) {
                 try {
-                    await executionContext.run({ isMobile: true, account }, async () => {
-                        await this.browser.func.closeBrowser(mobileSession!.context, accountEmail)
-                    })
+                    await closeMobileSession()
                 } catch (error) {
                     this.logger.debug(
                         'main',
@@ -682,9 +961,7 @@ export class MicrosoftRewardsBot {
 
             if (desktopSession) {
                 try {
-                    await executionContext.run({ isMobile: false, account }, async () => {
-                        await this.browser.func.closeBrowser(desktopSession!.context, accountEmail)
-                    })
+                    await closeDesktopSession()
                 } catch (error) {
                     this.logger.debug(
                         'main',
@@ -692,7 +969,6 @@ export class MicrosoftRewardsBot {
                         `Desktop context close failed | ${error instanceof Error ? error.message : String(error)}`
                     )
                 }
-                desktopSession = null
             }
         }
     }
@@ -749,6 +1025,8 @@ async function main(): Promise<void> {
         await rewardsBot.run()
     } catch (error) {
         rewardsBot.logger.error('main', 'MAIN-ERROR', error as Error)
+        await flushAllWebhooks()
+        process.exitCode = 1
     }
 }
 

@@ -2,9 +2,6 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 
-// Kept in sync with rewards-dashboard/lib/cron.js's isValidCron - same
-// 5-field grammar. Duplicated here because the bot and dashboard are
-// separate projects that don't share a package.
 const CRON_FIELD_RANGES = [
     { min: 0, max: 59 }, // minute
     { min: 0, max: 23 }, // hour
@@ -16,6 +13,8 @@ const CRON_FIELD_RANGES = [
 function validateField(expr, { min, max }) {
     if (expr === '*') return true
     for (const part of expr.split(',')) {
+        if (!/^(?:\*|\d+|\d+-\d+)(?:\/\d+)?$/.test(part)) return false
+
         const stepSplit = part.split('/')
         if (stepSplit.length > 2) return false
 
@@ -49,20 +48,10 @@ export function isValidCron(expr) {
     return parts.every((part, i) => validateField(part, CRON_FIELD_RANGES[i]))
 }
 
-// The override file lives inside the ./config bind mount that's already
-// mounted by compose_bot.yaml, so no new volume is required to persist it
-// across container restarts.
 export function scheduleFilePath(projectRoot) {
     return process.env.SCHEDULE_FILE || path.join(projectRoot, 'config', 'schedule.json')
 }
 
-/**
- * Returns the effective schedule: the persisted override if one has been
- * written via PUT /schedule, otherwise the CRON_SCHEDULE env var as set at
- * container start (so a bot with no frontend attached still reports something
- * sensible, and reports it as `source: 'env'` so callers know it isn't live-editable
- * without first calling PUT).
- */
 export function readSchedule(projectRoot) {
     const file = scheduleFilePath(projectRoot)
     if (fs.existsSync(file)) {
@@ -72,13 +61,45 @@ export function readSchedule(projectRoot) {
         } catch (err) {
             throw Object.assign(new Error(`schedule.json is corrupt: ${err.message}`), { code: 'CORRUPT_SCHEDULE' })
         }
+        const enabled = saved.enabled === undefined ? false : saved.enabled
+        const cron = saved.cron == null ? null : saved.cron
+        const skipIfRunning = saved.skipIfRunning === undefined ? true : saved.skipIfRunning
+        const excludedAccountIndexes = saved.excludedAccountIndexes ?? []
+
+        if (typeof enabled !== 'boolean') {
+            throw Object.assign(new Error('schedule.json has a non-boolean `enabled` value.'), {
+                code: 'CORRUPT_SCHEDULE'
+            })
+        }
+        if (cron !== null && (typeof cron !== 'string' || !isValidCron(cron))) {
+            throw Object.assign(new Error('schedule.json has an invalid `cron` expression.'), {
+                code: 'CORRUPT_SCHEDULE'
+            })
+        }
+        if (typeof skipIfRunning !== 'boolean') {
+            throw Object.assign(new Error('schedule.json has a non-boolean `skipIfRunning` value.'), {
+                code: 'CORRUPT_SCHEDULE'
+            })
+        }
+        if (
+            !Array.isArray(excludedAccountIndexes) ||
+            excludedAccountIndexes.some(index => !Number.isSafeInteger(index) || index < 1)
+        ) {
+            throw Object.assign(new Error('schedule.json has invalid `excludedAccountIndexes`.'), {
+                code: 'CORRUPT_SCHEDULE'
+            })
+        }
+        if (enabled && !cron) {
+            throw Object.assign(new Error('schedule.json enables scheduling without a cron expression.'), {
+                code: 'CORRUPT_SCHEDULE'
+            })
+        }
+
         return {
-            enabled: Boolean(saved.enabled),
-            cron: typeof saved.cron === 'string' ? saved.cron : null,
-            skipIfRunning: saved.skipIfRunning !== false,
-            excludedAccountIndexes: Array.isArray(saved.excludedAccountIndexes)
-                ? saved.excludedAccountIndexes.filter(n => Number.isInteger(n) && n >= 1)
-                : [],
+            enabled,
+            cron: cron?.trim() ?? null,
+            skipIfRunning,
+            excludedAccountIndexes: [...new Set(excludedAccountIndexes)].sort((a, b) => a - b),
             updatedAt: saved.updatedAt || null,
             timezone: process.env.TZ || 'UTC',
             source: 'override'
@@ -107,8 +128,18 @@ export function writeSchedule(projectRoot, patch) {
         }
         next.cron = patch.cron.trim()
     }
-    if ('enabled' in patch) next.enabled = Boolean(patch.enabled)
-    if ('skipIfRunning' in patch) next.skipIfRunning = Boolean(patch.skipIfRunning)
+    if ('enabled' in patch) {
+        if (typeof patch.enabled !== 'boolean') {
+            throw Object.assign(new Error('enabled must be a boolean.'), { code: 'BAD_REQUEST' })
+        }
+        next.enabled = patch.enabled
+    }
+    if ('skipIfRunning' in patch) {
+        if (typeof patch.skipIfRunning !== 'boolean') {
+            throw Object.assign(new Error('skipIfRunning must be a boolean.'), { code: 'BAD_REQUEST' })
+        }
+        next.skipIfRunning = patch.skipIfRunning
+    }
     if ('excludedAccountIndexes' in patch) {
         if (!Array.isArray(patch.excludedAccountIndexes)) {
             throw Object.assign(new Error('excludedAccountIndexes must be an array.'), { code: 'BAD_REQUEST' })
@@ -143,13 +174,6 @@ export function writeSchedule(projectRoot, patch) {
 const CRON_FILE = '/etc/cron.d/microsoft-rewards-cron'
 const CRON_TEMPLATE = '/etc/cron.d/microsoft-rewards-cron.template'
 
-/**
- * Renders the crontab template with the given schedule and loads it live via
- * `crontab <file>` - the same mechanism entrypoint.sh uses at startup, which
- * is why cron picks it up without a container restart. Note the template has
- * no `user` field, so it's only valid when loaded via `crontab`, not via
- * cron.d's own directory auto-scan.
- */
 export function applyCrontab({ enabled, cron }) {
     if (!enabled || !cron) {
         try {

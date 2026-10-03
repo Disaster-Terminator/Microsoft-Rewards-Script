@@ -1,5 +1,5 @@
 import { URLs } from '../../../constants/urls'
-import { Workers } from '../../Workers'
+import { BaseActivity } from '../BaseActivity'
 
 const STREAK_PROTECTION_ACTION_NAMES = [
     'reportSetStreakProtection',
@@ -9,7 +9,7 @@ const STREAK_PROTECTION_ACTION_NAMES = [
     'reportStreakProtection'
 ]
 
-export class EnsureStreakProtection extends Workers {
+export class EnsureStreakProtection extends BaseActivity {
     public async ensureStreakProtection() {
         const resolved = this.resolveActionId()
         if (!resolved) {
@@ -93,17 +93,12 @@ export class EnsureStreakProtection extends Workers {
 
     private async readStreakProtection() {
         try {
-            const page = this.bot.isMobile ? this.bot.mainMobilePage : this.bot.mainDesktopPage
-            const res = await page.request.get(URLs.rewards.earn)
-            if (!res.ok()) {
-                this.bot.logger.warn(
-                    this.bot.isMobile,
-                    'ENABLE-STREAK-PROTECTION',
-                    `Verify fetch failed | status=${res.status()}`
-                )
+            const html = await this.bot.browser.func.getRewardsPageHtml(URLs.rewards.earn, '/earn')
+            if (!html) {
+                this.bot.logger.warn(this.bot.isMobile, 'ENABLE-STREAK-PROTECTION', 'Verify fetch failed')
                 return null
             }
-            return this.bot.browser.react.getStreakProtection(await res.text())
+            return this.bot.browser.react.getStreakProtection(html)
         } catch (error) {
             this.bot.logger.warn(
                 this.bot.isMobile,

@@ -4,9 +4,12 @@ import { BrowserFingerprintWithHeaders, FingerprintGenerator } from 'fingerprint
 
 import type { MicrosoftRewardsBot } from '../index'
 import { loadSession, saveFingerprint } from '../util/SessionStore'
+import { fingerprintMatchesLocale } from '../util/Locale'
+import { formatBrowserProxyServer } from '../util/Proxy'
 import { UserAgentManager } from './UserAgent'
 
-import type { Account, AccountProxy } from '../interface/Account'
+import type { Account } from '../interface/Account'
+import { configureMediaBlocking } from './MediaBlocker'
 
 /* Test Stuff
 https://abrahamjuliot.github.io/creepjs/
@@ -23,36 +26,39 @@ interface BrowserCreationResult {
 
 class Browser {
     private readonly bot: MicrosoftRewardsBot
+    private readonly fingerprintGenerator = new FingerprintGenerator()
+    private readonly userAgentManager: UserAgentManager
     private static readonly BROWSER_ARGS = [
         '--mute-audio',
         '--no-first-run',
         '--no-default-browser-check',
         '--disable-web-authentication-ui',
         '--disable-external-intent-requests',
-        '--disable-blink-features=AutomationControlled,Attestation',
+        '--disable-blink-features=AutomationControlled',
         '--disable-features=WebAuthentication,PasswordManagerOnboarding,PasswordManager,EnablePasswordsAccountStorage,Passkeys,WebAuthenticationProxy,U2F',
         '--disable-save-password-bubble',
         '--disable-dev-shm-usage',
         '--disable-background-networking',
         '--disable-backgrounding-occluded-windows',
-        '--disable-renderer-backgrounding',
-        '--disable-component-update'
+        '--disable-renderer-backgrounding'
     ] as const
 
     constructor(bot: MicrosoftRewardsBot) {
         this.bot = bot
+        this.userAgentManager = new UserAgentManager(bot)
     }
 
     async createBrowser(account: Account): Promise<BrowserCreationResult> {
         const headless = this.bot.config.headless
 
         const hasProxy = Boolean(account.proxy.url)
+        const ignoreCertificateErrors = hasProxy && this.bot.config.proxy.ignoreCertificateErrors
 
         let browser: rebrowser.Browser
         try {
             const proxyConfig = account.proxy.url
                 ? {
-                      server: this.formatProxyServer(account.proxy),
+                      server: formatBrowserProxyServer(account.proxy.url, account.proxy.port),
                       ...(account.proxy.username &&
                           account.proxy.password && {
                               username: account.proxy.username,
@@ -61,16 +67,26 @@ class Browser {
                   }
                 : undefined
 
-            const sandboxArgs = process.platform === 'win32' ? [] : ['--no-sandbox', '--disable-setuid-sandbox']
+            const runningAsRoot = typeof process.getuid === 'function' && process.getuid() === 0
+            const sandboxDisabled = process.platform === 'linux' && runningAsRoot
+            const sandboxArgs = sandboxDisabled ? ['--no-sandbox', '--disable-setuid-sandbox'] : []
 
-            const certArgs = hasProxy
+            const certArgs = ignoreCertificateErrors
                 ? ['--ignore-certificate-errors', '--ignore-certificate-errors-spki-list', '--ignore-ssl-errors']
                 : []
+
+            if (ignoreCertificateErrors) {
+                this.bot.logger.warn(
+                    this.bot.isMobile,
+                    'BROWSER-SECURITY',
+                    'TLS certificate verification is disabled by proxy.ignoreCertificateErrors'
+                )
+            }
 
             this.bot.logger.info(
                 this.bot.isMobile,
                 'BROWSER',
-                `Launching bundled patched Chromium (Edge UA) | headless: ${headless} | platform: ${process.platform} | proxy: ${hasProxy ? 'yes (TLS errors ignored)' : 'no (TLS validated)'}`
+                `Launching bundled patched Chromium (Edge UA) | headless=${headless} | platform=${process.platform} | proxy=${hasProxy ? 'yes' : 'no'} | tls=${ignoreCertificateErrors ? 'verification-disabled' : 'verified'} | sandbox=${sandboxDisabled ? 'disabled-root' : 'enabled'}`
             )
 
             browser = await rebrowser.chromium.launch({
@@ -87,12 +103,42 @@ class Browser {
         try {
             const session = loadSession(this.bot.config.sessionPath, account.email, this.bot.isMobile)
 
+            if (session?.storageState) {
+                const ageMinutes = Math.max(0, Math.floor((Date.now() - session.updatedAt) / 60000))
+                this.bot.logger.info(
+                    this.bot.isMobile,
+                    'SESSION',
+                    `Restoring saved browser session | cookies=${session.storageState.cookies.length} | origins=${session.storageState.origins.length} | ageMinutes=${ageMinutes}` +
+                        (session.expiredCookiesRemoved
+                            ? ` | expiredCookiesRemoved=${session.expiredCookiesRemoved}`
+                            : '')
+                )
+            } else {
+                this.bot.logger.info(
+                    this.bot.isMobile,
+                    'SESSION',
+                    'No saved browser session found; login may be required'
+                )
+            }
+
             const shouldUseFingerprint = this.bot.isMobile
                 ? account.saveFingerprint.mobile
                 : account.saveFingerprint.desktop
 
+            const savedFingerprint = shouldUseFingerprint ? session?.fingerprint : null
+            const reuseFingerprint =
+                savedFingerprint && fingerprintMatchesLocale(savedFingerprint, this.bot.accountLocale)
+
+            if (savedFingerprint && !reuseFingerprint) {
+                this.bot.logger.info(
+                    this.bot.isMobile,
+                    'BROWSER-FINGERPRINT',
+                    `Saved fingerprint locale does not match ${this.bot.accountLocale.locale}; generating a replacement`
+                )
+            }
+
             const fingerprint =
-                (shouldUseFingerprint && session?.fingerprint) || (await this.generateFingerprint(this.bot.isMobile))
+                (reuseFingerprint && savedFingerprint) || (await this.generateFingerprint(this.bot.isMobile))
 
             const screen = fingerprint.fingerprint.screen
 
@@ -101,7 +147,7 @@ class Browser {
                 fingerprint,
                 newContextOptions: {
                     permissions: [],
-                    ignoreHTTPSErrors: hasProxy,
+                    ignoreHTTPSErrors: ignoreCertificateErrors,
                     // Restore cookies
                     ...(session?.storageState ? { storageState: session.storageState } : {}),
                     ...(this.bot.isMobile
@@ -117,38 +163,18 @@ class Browser {
             })
             const context = injected as unknown as BrowserContext
 
-            await context.addInitScript(() => {
-                try {
-                    Object.defineProperty(navigator, 'webdriver', { configurable: true, get: () => false })
-                } catch {}
+            if (hasProxy) {
+                await context.addInitScript(() => {
+                    // @ts-expect-error Chromium-specific runtime globals
+                    delete window.RTCPeerConnection
+                    // @ts-expect-error Legacy Chromium runtime global
+                    delete window.webkitRTCPeerConnection
+                    // @ts-expect-error Chromium-specific runtime global
+                    delete window.RTCDataChannel
+                })
+            }
 
-                const rejectWebAuthn = () => Promise.reject(new DOMException('WebAuthn disabled', 'NotAllowedError'))
-                try {
-                    Object.defineProperty(navigator, 'credentials', {
-                        configurable: true,
-                        get: () => ({
-                            create: rejectWebAuthn,
-                            get: rejectWebAuthn,
-                            preventSilentAccess: () => Promise.resolve()
-                        })
-                    })
-                } catch {}
-
-                try {
-                    if (window.PublicKeyCredential) {
-                        window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable = () =>
-                            Promise.resolve(false)
-                    }
-                } catch {}
-
-                // Block WebRTC so the real ip can't leak past the proxy
-                // @ts-expect-error Removing since it might potentionally, kinda unsurely leak the machine's details to browser
-                delete window.RTCPeerConnection
-                // @ts-expect-error Same as above
-                delete window.webkitRTCPeerConnection
-                // @ts-expect-error if you read this, Netsky was here struggling :(
-                delete window.RTCDataChannel
-            })
+            await configureMediaBlocking(this.bot, context)
 
             context.on('page', p => {
                 p.on('crash', () =>
@@ -159,14 +185,14 @@ class Browser {
 
             context.setDefaultTimeout(this.bot.utils.stringToNumber(this.bot.config?.globalTimeout ?? 30000))
 
-            if (shouldUseFingerprint) {
+            if (shouldUseFingerprint && !reuseFingerprint) {
                 saveFingerprint(this.bot.config.sessionPath, account.email, this.bot.isMobile, fingerprint)
             }
 
             this.bot.logger.info(
                 this.bot.isMobile,
                 'BROWSER',
-                `Created context | User-Agent: "${fingerprint.fingerprint.navigator.userAgent}"`
+                `Created context | locale=${this.bot.accountLocale.locale} | Accept-Language="${this.bot.accountLocale.acceptLanguage}" | User-Agent: "${fingerprint.fingerprint.navigator.userAgent}"`
             )
             this.bot.logger.debug(this.bot.isMobile, 'BROWSER-FINGERPRINT', JSON.stringify(fingerprint))
 
@@ -177,28 +203,18 @@ class Browser {
         }
     }
 
-    private formatProxyServer(proxy: AccountProxy): string {
-        try {
-            const urlObj = new URL(proxy.url)
-            const protocol = urlObj.protocol.replace(':', '')
-            return `${protocol}://${urlObj.hostname}:${proxy.port}`
-        } catch {
-            return `${proxy.url}:${proxy.port}`
-        }
-    }
-
     async generateFingerprint(isMobile: boolean): Promise<BrowserFingerprintWithHeaders> {
         const hostOs: 'windows' | 'macos' | 'linux' =
             process.platform === 'darwin' ? 'macos' : process.platform === 'linux' ? 'linux' : 'windows'
 
-        const fingerPrintData = new FingerprintGenerator().getFingerprint({
+        const fingerPrintData = this.fingerprintGenerator.getFingerprint({
             devices: isMobile ? ['mobile'] : ['desktop'],
             operatingSystems: isMobile ? ['android'] : [hostOs],
-            browsers: [{ name: 'edge' }]
+            browsers: [{ name: 'edge' }],
+            locales: this.bot.accountLocale.acceptedLocales
         })
 
-        const userAgentManager = new UserAgentManager(this.bot)
-        return await userAgentManager.updateFingerprintUserAgent(fingerPrintData, isMobile)
+        return this.userAgentManager.updateFingerprintUserAgent(fingerPrintData, isMobile)
     }
 }
 

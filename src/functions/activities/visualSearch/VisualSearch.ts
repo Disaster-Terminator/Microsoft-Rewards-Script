@@ -1,29 +1,35 @@
-import { Workers } from '../../Workers'
+import { BaseActivity } from '../BaseActivity'
 
 import type { ParsedOffer, StreakState } from '../../../browser/ReactFunc'
 import type { DashboardData } from '../../../interface/DashboardData'
+import { VisualSearchBrowser } from './VisualSearchBrowser'
 
 const VISUAL_SEARCH_ACTIVATION_OFFER = 'visualsearch_streak_activation_v2'
 
-// 11 is confirmed for the July banner and carried over to the v2 offer, verify before trusting it there
 const VERIFIED_ACTIVITY_TYPES = new Map<string, number>([
     ['ww_visualsearch_summerjuly26_activation_banner', 11],
-    ['visualsearch_streak_activation_v2', 11]
+    ['visualsearch_streak_activation_v2', 714]
 ])
 
-const MAX_ATTEMPTS = 3
-
-const MAX_SEED_ROLLS = 3
+const MAX_ATTEMPTS = 4
+const MAX_ACQUISITION_FAILURES_PER_ATTEMPT = 3
+const REGISTRATION_CHECKS = 3
 
 type ActivationResult = 'activated' | 'already-active' | 'absent' | 'failed'
 
 interface ActivationMetadata {
     activityType: number
-    activityTypeSource: 'react' | 'dashboard' | 'verified-fallback'
+    activityTypeSource: 'react' | 'streak' | 'dashboard' | 'verified-fallback'
     isPromotional: boolean
 }
 
-export class VisualSearch extends Workers {
+interface ActivationTarget extends ParsedOffer {
+    activationSource: 'streak' | 'offer'
+}
+
+export class VisualSearch extends BaseActivity {
+    private readonly browserFlow = new VisualSearchBrowser(this.bot)
+
     public async doVisualSearch(data: DashboardData): Promise<number> {
         if (this.bot.isMobile) {
             this.bot.logger.debug(this.bot.isMobile, 'VISUAL-SEARCH', 'Skipping on mobile - desktop-only activity')
@@ -45,7 +51,7 @@ export class VisualSearch extends Workers {
 
         const activation = await this.activate(data)
 
-        const available = !!streak || activation === 'activated' || activation === 'already-active'
+        const available = streak?.isEnabled === true || activation === 'activated' || activation === 'already-active'
         if (!available) {
             this.bot.logger.info(
                 this.bot.isMobile,
@@ -59,8 +65,16 @@ export class VisualSearch extends Workers {
     }
 
     private findStreak(streaks?: StreakState[]): StreakState | undefined {
-        const source = streaks ?? this.bot.reactSnapshot?.streaks ?? []
-        return source.find(s => /visual.?search/i.test(s.partner))
+        if (streaks) return streaks.find(s => /visual.?search/i.test(s.partner))
+
+        const snapshots = [this.bot.reactSnapshot, this.bot.reactSnapshots.desktop, this.bot.reactSnapshots.mobile]
+
+        for (const snapshot of snapshots) {
+            const streak = snapshot?.streaks.find(s => /visual.?search/i.test(s.partner))
+            if (streak) return streak
+        }
+
+        return undefined
     }
 
     private logStreakState(streak: StreakState | undefined): void {
@@ -89,21 +103,21 @@ export class VisualSearch extends Workers {
     }
 
     private async activate(data: DashboardData): Promise<ActivationResult> {
-        const offer = this.findActivationOffer()
+        const offer = this.findActivationTarget()
         if (!offer) {
             this.bot.logger.debug(
                 this.bot.isMobile,
                 'VISUAL-SEARCH',
-                'No visual-search activation offer present on the dashboard'
+                'No visual-search activation metadata present in the streak model or generic offers across the current, desktop, or cached mobile Rewards snapshots'
             )
             return 'absent'
         }
 
-        if (!offer.reportable) {
+        if (offer.isCompleted) {
             this.bot.logger.info(
                 this.bot.isMobile,
                 'VISUAL-SEARCH',
-                `Visual search already active (or not activatable) | offerId=${offer.offerId}`,
+                `Visual search activation offer already completed | offerId=${offer.offerId}`,
                 'green'
             )
             return 'already-active'
@@ -114,6 +128,15 @@ export class VisualSearch extends Workers {
                 this.bot.isMobile,
                 'VISUAL-SEARCH',
                 `Activation offer present but missing a hash | offerId=${offer.offerId}`
+            )
+            return 'failed'
+        }
+
+        if (!offer.reportable && !offer.isLocked) {
+            this.bot.logger.warn(
+                this.bot.isMobile,
+                'VISUAL-SEARCH',
+                `Activation offer is not actionable | offerId=${offer.offerId}`
             )
             return 'failed'
         }
@@ -142,7 +165,7 @@ export class VisualSearch extends Workers {
         this.bot.logger.info(
             this.bot.isMobile,
             'VISUAL-SEARCH',
-            `Activating visual search | offerId=${offer.offerId} | activityType=${metadata.activityType} | activityTypeSource=${metadata.activityTypeSource} | promotional=${metadata.isPromotional} | geo=${this.bot.userData.geoLocale}`
+            `Activating visual search | offerId=${offer.offerId} | activationSource=${offer.activationSource} | activityType=${metadata.activityType} | activityTypeSource=${metadata.activityTypeSource} | promotional=${metadata.isPromotional} | geo=${this.bot.userData.geoLocale}`
         )
 
         try {
@@ -156,14 +179,16 @@ export class VisualSearch extends Workers {
                 }
             ])
 
-            if (acknowledged) {
+            await this.bot.utils.wait(this.bot.utils.randomDelay(3000, 6000))
+            const confirmed = await this.confirmActivation(offer.offerId)
+
+            if (acknowledged || confirmed) {
                 this.bot.logger.info(
                     this.bot.isMobile,
                     'VISUAL-SEARCH',
-                    `Activated visual search | offerId=${offer.offerId}`,
+                    `Activated visual search | offerId=${offer.offerId} | acknowledged=${acknowledged} | confirmed=${confirmed}`,
                     'green'
                 )
-                await this.bot.utils.wait(this.bot.utils.randomDelay(5000, 10000))
                 return 'activated'
             }
 
@@ -183,6 +208,26 @@ export class VisualSearch extends Workers {
         }
     }
 
+    private async confirmActivation(offerId: string): Promise<boolean> {
+        try {
+            const snapshot = await this.bot.browser.func.refreshEarnSnapshot()
+            if (!snapshot) return false
+
+            this.bot.reactSnapshot = snapshot
+
+            const streak = this.findStreak(snapshot.streaks)
+            const activationOffer = snapshot.offers.find(o => o.offerId === offerId)
+            return streak?.isEnabled === true || activationOffer?.isCompleted === true
+        } catch (error) {
+            this.bot.logger.debug(
+                this.bot.isMobile,
+                'VISUAL-SEARCH',
+                `Could not verify activation state | offerId=${offerId} | ${error instanceof Error ? error.message : String(error)}`
+            )
+            return false
+        }
+    }
+
     private async resolveDashboard(fallback: DashboardData): Promise<DashboardData> {
         try {
             return await this.bot.browser.func.getDashboardData(this.bot.cookies.desktop)
@@ -196,13 +241,13 @@ export class VisualSearch extends Workers {
         }
     }
 
-    private resolveActivationMetadata(offer: ParsedOffer, data: DashboardData): ActivationMetadata | null {
+    private resolveActivationMetadata(offer: ActivationTarget, data: DashboardData): ActivationMetadata | null {
         const dashboardPromotion = this.findDashboardPromotion(data.dashboard, offer.offerId)
 
         if (offer.activityType !== null) {
             return {
                 activityType: offer.activityType,
-                activityTypeSource: 'react',
+                activityTypeSource: offer.activationSource === 'streak' ? 'streak' : 'react',
                 isPromotional: offer.isPromotional || this.dashboardPromotionIsPromotional(dashboardPromotion)
             }
         }
@@ -278,36 +323,107 @@ export class VisualSearch extends Workers {
         return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null
     }
 
-    private findActivationOffer(): ParsedOffer | null {
-        const offers = this.bot.reactSnapshot?.offers ?? []
+    private findActivationTarget(): ActivationTarget | null {
+        const snapshots = [
+            { source: 'current', snapshot: this.bot.reactSnapshot },
+            { source: 'desktop', snapshot: this.bot.reactSnapshots.desktop },
+            { source: 'mobile', snapshot: this.bot.reactSnapshots.mobile }
+        ] as const
 
-        const exact = offers.find(o => o.offerId === VISUAL_SEARCH_ACTIVATION_OFFER)
-        if (exact) return exact
+        const seen = new Set<unknown>()
 
-        return (
-            offers.find(o => {
+        // New Rewards format: activation metadata is carried directly by the streak model.
+        for (const { source, snapshot } of snapshots) {
+            if (!snapshot || seen.has(snapshot)) continue
+            seen.add(snapshot)
+
+            const streak = this.findStreak(snapshot.streaks)
+            if (!streak?.activationOfferId || !streak.activationHash) continue
+
+            if (source !== 'current') {
+                this.bot.logger.debug(
+                    this.bot.isMobile,
+                    'VISUAL-SEARCH',
+                    `Activation metadata missing from the current snapshot; using cached ${source} streak snapshot | offerId=${streak.activationOfferId}`
+                )
+            } else {
+                this.bot.logger.debug(
+                    this.bot.isMobile,
+                    'VISUAL-SEARCH',
+                    `Using visual-search activation metadata from streak model | offerId=${streak.activationOfferId}`
+                )
+            }
+
+            return {
+                offerId: streak.activationOfferId,
+                hash: streak.activationHash,
+                title: 'Visual Search Streak',
+                description: '',
+                points: 0,
+                promotionSubtype: null,
+                destination: streak.destinationUrl ?? '',
+                isCompleted: streak.isEnabled,
+                isPromotional: false,
+                isLocked: false,
+                unlockCriteria: null,
+                date: null,
+                activityType: streak.activationActivityType,
+                reportable: true,
+                activationSource: 'streak'
+            }
+        }
+
+        // Legacy/current alternate format: activation appears as a regular Rewards offer.
+        seen.clear()
+        for (const { source, snapshot } of snapshots) {
+            if (!snapshot || seen.has(snapshot)) continue
+            seen.add(snapshot)
+
+            const exact = snapshot.offers.find(o => o.offerId === VISUAL_SEARCH_ACTIVATION_OFFER)
+            const fuzzy = snapshot.offers.find(o => {
                 const id = o.offerId.toLowerCase()
                 return id.includes('visualsearch') && id.includes('activation')
-            }) ?? null
-        )
+            })
+            const offer = exact ?? fuzzy
+            if (!offer) continue
+
+            if (source !== 'current') {
+                this.bot.logger.debug(
+                    this.bot.isMobile,
+                    'VISUAL-SEARCH',
+                    `Activation offer missing from the current snapshot; using cached ${source} offer snapshot | offerId=${offer.offerId}`
+                )
+            } else {
+                this.bot.logger.debug(
+                    this.bot.isMobile,
+                    'VISUAL-SEARCH',
+                    `Using visual-search activation metadata from generic offer | offerId=${offer.offerId}`
+                )
+            }
+
+            return { ...offer, activationSource: 'offer' }
+        }
+
+        return null
     }
 
     private async performDailySearch(): Promise<number> {
         const seenBcids = new Set<string>()
+        const candidateSeeds = await this.browserFlow.getSeedUrls()
 
         for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-            const visual = await this.acquireFreshVisualSearch(seenBcids, attempt)
+            const visual = await this.acquireFreshVisualSearch(seenBcids, candidateSeeds, attempt)
             if (!visual) {
                 await this.bot.utils.wait(this.bot.utils.randomDelay(3000, 6000))
                 continue
             }
 
-            const res = await this.bot.browser.func.reportVisualSearchActivity(visual)
+            const res = await this.browserFlow.report(visual)
 
             if (res.balance != null) this.bot.userData.currentPoints = res.balance
 
             const gained = res.gained ?? 0
-            if (gained > 0) {
+            if (gained >= 5) {
                 this.bot.userData.gainedPoints = (this.bot.userData.gainedPoints ?? 0) + gained
                 this.bot.logger.info(
                     this.bot.isMobile,
@@ -318,7 +434,7 @@ export class VisualSearch extends Workers {
                 return gained
             }
 
-            if (await this.dayRegistered()) {
+            if (await this.waitForDayRegistration()) {
                 this.bot.logger.info(
                     this.bot.isMobile,
                     'VISUAL-SEARCH',
@@ -328,7 +444,7 @@ export class VisualSearch extends Workers {
                 return 0
             }
 
-            if (res.ig) {
+            if (res.acknowledged) {
                 this.bot.logger.warn(
                     this.bot.isMobile,
                     'VISUAL-SEARCH',
@@ -356,17 +472,25 @@ export class VisualSearch extends Workers {
     // bcid is derived from the image bytes, so a repeated seed produces a blob bing already credited
     private async acquireFreshVisualSearch(
         seen: Set<string>,
+        candidateSeeds: string[],
         attempt: number
     ): Promise<{ bcid: string; query: string; serpUrl: string } | null> {
-        for (let roll = 1; roll <= MAX_SEED_ROLLS; roll++) {
-            const visual = await this.bot.browser.func.acquireVisualSearch()
+        let acquisitionFailures = 0
+
+        while (candidateSeeds.length) {
+            const seed = candidateSeeds.shift()
+            if (!seed) continue
+
+            const visual = await this.browserFlow.acquire(seed)
             if (!visual) {
                 this.bot.logger.warn(
                     this.bot.isMobile,
                     'VISUAL-SEARCH',
-                    `Could not obtain a visual search (attempt ${attempt}/${MAX_ATTEMPTS})`
+                    `Could not obtain a visual search from one candidate (attempt ${attempt}/${MAX_ATTEMPTS})`
                 )
-                return null
+                acquisitionFailures++
+                if (acquisitionFailures >= MAX_ACQUISITION_FAILURES_PER_ATTEMPT) return null
+                continue
             }
 
             if (!seen.has(visual.bcid)) {
@@ -377,7 +501,7 @@ export class VisualSearch extends Workers {
             this.bot.logger.warn(
                 this.bot.isMobile,
                 'VISUAL-SEARCH',
-                `Seed produced an already-used bcid=${visual.bcid.slice(0, 14)} - re-rolling (${roll}/${MAX_SEED_ROLLS})`
+                `Skipping already-tried bcid=${visual.bcid.slice(0, 14)} | candidatesRemaining=${candidateSeeds.length}`
             )
             await this.bot.utils.wait(this.bot.utils.randomDelay(1000, 2000))
         }
@@ -385,9 +509,20 @@ export class VisualSearch extends Workers {
         this.bot.logger.warn(
             this.bot.isMobile,
             'VISUAL-SEARCH',
-            `Seed rotation is not varying the bcid (attempt ${attempt}/${MAX_ATTEMPTS}) - check the image source`
+            `No unused visual-search seed remains (attempt ${attempt}/${MAX_ATTEMPTS})`
         )
         return null
+    }
+
+    private async waitForDayRegistration(): Promise<boolean> {
+        for (let check = 1; check <= REGISTRATION_CHECKS; check++) {
+            if (check > 1) {
+                await this.bot.utils.wait(this.bot.utils.randomDelay(2000, 4000))
+            }
+            if (await this.dayRegistered()) return true
+        }
+
+        return false
     }
 
     private async dayRegistered(): Promise<boolean> {

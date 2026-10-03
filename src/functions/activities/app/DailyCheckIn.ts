@@ -1,9 +1,9 @@
 import { URLs } from '../../../constants/urls'
 import type { HttpRequestConfig } from '../../../util/Http'
 import { randomUUID } from 'crypto'
-import { Workers } from '../../Workers'
+import { BaseActivity } from '../BaseActivity'
 
-export class DailyCheckIn extends Workers {
+export class DailyCheckIn extends BaseActivity {
     private gainedPoints: number = 0
 
     private oldBalance: number = this.bot.userData.currentPoints
@@ -100,7 +100,7 @@ export class DailyCheckIn extends Workers {
                     'X-Rewards-AppId': 'SAIOS/33.4.440603001',
                     'X-Rewards-PartnerId': 'startapp',
                     'X-Rewards-Country': this.bot.userData.geoLocale,
-                    'X-Rewards-Language': 'en',
+                    'X-Rewards-Language': this.bot.userData.langCode,
                     'X-Rewards-Flights': 'rwgobig',
                     'X-Rewards-IsMobile': 'true'
                 },

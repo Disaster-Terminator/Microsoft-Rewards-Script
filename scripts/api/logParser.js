@@ -1,4 +1,4 @@
-const ANSI_RE = /\u001B\[[0-9;]*m/g
+const ANSI_RE = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g')
 
 export function stripAnsi(str) {
     return typeof str === 'string' ? str.replace(ANSI_RE, '') : str
@@ -55,11 +55,13 @@ export function createRunState() {
         accountsTotal: null,
         currentEmail: null,
         userToEmail: {}, // log "user" (email localpart) -> full email, for attributing live lines
+        lastPointUpdateAt: null,
         totals: null, // { collected, oldTotal, newTotal, runtimeMinutes, accountsProcessed }
         order: [], // emails in the order they started
         accounts: {}, // email -> account summary
         errors: [], // recent error/warn messages { ts, level, title, message }
-        finished: false
+        finished: false,
+        pendingDelay: null // { seconds, nextEmail, sinceTs } while waiting between accounts/workers
     }
 }
 
@@ -69,12 +71,15 @@ function ensureAccount(state, email) {
         state.accounts[email] = {
             email,
             geoLocale: null,
+            locale: null,
+            cachedRegion: null,
             initialPoints: null,
             collectedPoints: null,
             finalPoints: null,
-            earnable: null, // { mobile, browser, app } as reported in the "Earnable today" line
+            earnable: null, // { mobile, browser, app }; browser is the desktop search pool
             searchSummary: null, // { mobile, desktop, bonus, total }
             streakProtection: null, // { enabled, remainingDays, streakCounter, updatedAt }
+            edgeBrowsing: null, // background Edge activity progress and ETA
             durationSeconds: null,
             success: null,
             error: null,
@@ -92,24 +97,39 @@ function ensureAccount(state, email) {
 
 const RE = {
     runStart: /^Starting Microsoft Rewards Script \| v(\S+) \| Accounts: (\d+) \| Clusters: (\d+)/,
-    accountStart: /^Starting account: (\S+) \| geoLocale: (.+?)\s*$/,
-    earnable: /^Earnable today \| Mobile: (\d+) \| Browser: (\d+) \| App: (\d+) \| (\S+) \| locale: (\S+)/,
+    accountStart:
+        /^Starting account: (\S+) \| geoLocale: ([^|]+?)(?: \| locale: (\S+))?(?: \| cachedRegion: (\S+))?\s*$/,
+    earnable: /^Earnable today \| Mobile: (\d+) \| Browser: (\d+) \| App: (\d+) \| (\S+) \| locale: (\S+)\s*$/,
     searchSummary: /^Search summary \| mobile=(-?\d+) \| desktop=(-?\d+) \| bonus=(-?\d+) \| total=(-?\d+)/,
     streakProtection:
-        /^Snapshot complete \| offers=(\d+) \| reportable=(\d+) \| streaks=(\d+) \| streakProtectionEnabled=(true|false) \| streakProtectionRemainingDays=(\d+|null) \| streakCounter=(\d+|null) \| level=([^|]+) \| account=(\S+@\S+)$/,
+        /^Snapshot complete \| offers=(\d+) \| reportable=(\d+) \| streaks=(\d+) \| streakProtectionEnabled=(true|false|null) \| streakProtectionRemainingDays=(\d+|null) \| streakCounter=(\d+|null) \| level=([^|]+) \| account=(\S+@\S+)$/,
     accountEnd:
         /^Completed account: (\S+) \| pointsGained=(-?\d+) \| previousBalance=(\d+) \| currentBalance=(\d+) \| durationSeconds=([\d.]+)/,
     runEnd: /^Completed all accounts \| accountsProcessed=(\d+) \| pointsGained=(-?\d+) \| previousBalance=(\d+) \| currentBalance=(\d+) \| runtimeMinutes=([\d.]+)/,
     accountError: /^(\S+@\S+): ([\s\S]+)$/,
     flowFailed: /flow failed for (\S+@\S+):/i,
+    accountDelay: /^Waiting ([\d.]+) seconds before starting the next account(?: \((\S+@\S+)\))?$/,
 
     searchStart: /^Starting Bing searches \| currentBalance=(\d+)/,
     flowCollected: /^Points collected \| pointsGained=(-?\d+) \| currentBalance=(\d+) \| account=(\S+@\S+)/
 }
 
 function numericField(message, name) {
-    const match = message.match(new RegExp(`(?:^| \\| )${name}=(-?\\d+)(?= \\| |$)`))
+    const match = message.match(new RegExp(`(?:^| \\| )${name}=(-?\\d+(?:\\.\\d+)?)(?= \\| |$)`))
     return match ? Number(match[1]) : null
+}
+
+function fractionField(message, name) {
+    const match = message.match(new RegExp(`(?:^| \\| )${name}=(\\d+)\\/(\\d+)(?= \\| |$)`))
+    return match ? { current: Number(match[1]), total: Number(match[2]) } : null
+}
+
+function eventTime(entry) {
+    return entry.receivedAt ?? entry.ts ?? null
+}
+
+function accountEmailForEntry(state, entry) {
+    return (entry.user && state.userToEmail[entry.user]) || state.currentEmail || null
 }
 
 function pointEventSource(title, message) {
@@ -150,14 +170,15 @@ function pointEventSource(title, message) {
 function applyLivePoints(state, entry) {
     const msg = entry.message ?? ''
 
-    const emailFromUser = user => (user ? state.userToEmail[user] : null)
-    const target = email => ensureAccount(state, email || emailFromUser(entry.user) || state.currentEmail)
+    const target = email => ensureAccount(state, email || accountEmailForEntry(state, entry))
     const num = s => {
         const n = Number(s)
         return Number.isFinite(n) ? n : null
     }
     const touch = acc => {
-        acc.live.lastUpdateTs = entry.ts
+        const at = eventTime(entry)
+        acc.live.lastUpdateTs = at
+        state.lastPointUpdateAt = at
     }
     const setBalance = (acc, balance) => {
         if (!acc || balance == null) return false
@@ -208,6 +229,119 @@ function applyLivePoints(state, entry) {
     return addGain(target(), gained ?? 0, balance, source)
 }
 
+function applyEdgeBrowsing(state, entry) {
+    if (entry.title !== 'EDGE-BROWSING') return null
+
+    const account = ensureAccount(state, accountEmailForEntry(state, entry))
+    if (!account) return null
+
+    const message = entry.message ?? ''
+    const finalReports = message.startsWith('Finished background Edge browsing activity')
+        ? numericField(message, 'reports')
+        : null
+    const progress =
+        fractionField(message, 'reportsCompleted') ??
+        fractionField(message, 'report') ??
+        (finalReports != null ? { current: finalReports, total: finalReports } : null)
+    const previous = account.edgeBrowsing ?? {
+        status: 'pending',
+        targetMinutes: null,
+        serverIntervalMinutes: null,
+        reportsCompleted: 0,
+        reportsTotal: null,
+        reportsRemaining: null,
+        scheduledMinutesCovered: 0,
+        nextReportInSeconds: null,
+        estimatedRemainingMinutes: null,
+        elapsedMinutes: null,
+        accepted: 0,
+        duplicates: 0,
+        failed: 0,
+        waitingForBackground: false,
+        updatedAt: null
+    }
+
+    if (message.startsWith('Started background Edge browsing activity')) {
+        previous.status = 'running'
+        previous.targetMinutes = numericField(message, 'targetMinutes')
+        previous.serverIntervalMinutes = numericField(message, 'serverIntervalMinutes')
+        previous.reportsTotal = numericField(message, 'reports')
+        previous.reportsRemaining = previous.reportsTotal
+        previous.scheduledMinutesCovered = 0
+        previous.estimatedRemainingMinutes = numericField(message, 'estimatedDurationMinutes')
+        previous.waitingForBackground = false
+    } else if (message.startsWith('Edge browsing progress')) {
+        previous.status = 'running'
+    } else if (message.startsWith('Submitted Edge browsing report')) {
+        previous.status = 'running'
+        previous.nextReportInSeconds = null
+    } else if (message.startsWith('Finished background Edge browsing activity')) {
+        const duplicates = numericField(message, 'duplicates') ?? previous.duplicates
+        const failed = numericField(message, 'failed') ?? previous.failed
+        const serverCompleteMatch = message.match(/(?:^| \| )serverComplete=(true|false)(?= \| |$)/)
+        const serverComplete = serverCompleteMatch ? serverCompleteMatch[1] === 'true' : null
+
+        if (serverComplete === true) previous.status = 'complete'
+        else if (serverComplete === false) previous.status = 'partial'
+        else previous.status = duplicates > 0 || failed > 0 ? 'partial' : 'complete'
+
+        previous.reportsRemaining = serverComplete === false ? previous.reportsRemaining : 0
+        previous.nextReportInSeconds = null
+        previous.estimatedRemainingMinutes = 0
+        previous.waitingForBackground = false
+    } else if (message === 'Browsing Streak on Edge is already complete') {
+        previous.status = 'complete'
+        previous.reportsRemaining = 0
+        previous.nextReportInSeconds = null
+        previous.estimatedRemainingMinutes = 0
+        previous.waitingForBackground = false
+    } else if (
+        message === 'Browsing Streak on Edge is not available for this account' ||
+        message.startsWith('Skipping:')
+    ) {
+        previous.status = 'skipped'
+        previous.waitingForBackground = false
+    } else if (
+        message.startsWith('Background Edge browsing activity failed') ||
+        message.startsWith('Unexpected background task failure')
+    ) {
+        previous.status = 'failed'
+        previous.waitingForBackground = false
+    } else if (message === 'Background activity cancelled') {
+        previous.status = 'cancelled'
+        previous.waitingForBackground = false
+    } else if (message.startsWith('Foreground activities finished;')) {
+        previous.waitingForBackground = true
+    } else {
+        return null
+    }
+
+    if (progress?.current != null) previous.reportsCompleted = progress.current
+    if (progress?.total != null) previous.reportsTotal = progress.total
+
+    const reportsRemaining = numericField(message, 'reportsRemaining')
+    const scheduledMinutes = fractionField(message, 'scheduledMinutesCovered')
+    const nextReportInSeconds = numericField(message, 'nextReportInSeconds')
+    const estimatedRemainingMinutes = numericField(message, 'estimatedRemainingMinutes')
+    const elapsedMinutes = numericField(message, 'elapsedMinutes')
+    const accepted = numericField(message, 'accepted')
+    const duplicates = numericField(message, 'duplicates')
+    const failed = numericField(message, 'failed')
+
+    if (reportsRemaining != null) previous.reportsRemaining = reportsRemaining
+    if (scheduledMinutes?.current != null) previous.scheduledMinutesCovered = scheduledMinutes.current
+    if (nextReportInSeconds != null) previous.nextReportInSeconds = nextReportInSeconds
+    if (estimatedRemainingMinutes != null) previous.estimatedRemainingMinutes = estimatedRemainingMinutes
+    if (elapsedMinutes != null) previous.elapsedMinutes = elapsedMinutes
+    if (accepted != null) previous.accepted = accepted
+    if (duplicates != null) previous.duplicates = duplicates
+    if (failed != null) previous.failed = failed
+
+    previous.updatedAt = eventTime(entry)
+    account.edgeBrowsing = previous
+    return 'edge-browsing'
+}
+
 export function applyLogToRunState(state, entry) {
     const msg = entry.message ?? ''
 
@@ -233,6 +367,8 @@ export function applyLogToRunState(state, entry) {
     if (!entry.parsed) return null
 
     if (applyLivePoints(state, entry)) return 'points'
+    const edgeBrowsingEvent = applyEdgeBrowsing(state, entry)
+    if (edgeBrowsingEvent) return edgeBrowsingEvent
 
     let m
     switch (entry.title) {
@@ -242,6 +378,7 @@ export function applyLogToRunState(state, entry) {
                 state.accountsTotal = Number(m[2])
                 state.clusters = Number(m[3])
                 state.finished = false
+                state.pendingDelay = null
                 return 'run-start'
             }
             break
@@ -249,10 +386,26 @@ export function applyLogToRunState(state, entry) {
         case 'ACCOUNT-START':
             if ((m = msg.match(RE.accountStart))) {
                 const acc = ensureAccount(state, m[1])
-                if (acc) acc.geoLocale = m[2]
+                if (acc) {
+                    acc.geoLocale = m[2].trim()
+                    acc.locale = m[3] || null
+                    acc.cachedRegion = m[4] || null
+                }
                 state.currentEmail = m[1]
                 if (entry.user) state.userToEmail[entry.user] = m[1] // map localpart -> full email
+                state.pendingDelay = null
                 return 'account-start'
+            }
+            break
+
+        case 'ACCOUNT-DELAY':
+            if ((m = msg.match(RE.accountDelay))) {
+                state.pendingDelay = {
+                    seconds: Number(m[1]),
+                    nextEmail: m[2] || null,
+                    sinceTs: eventTime(entry)
+                }
+                return 'account-delay'
             }
             break
 
@@ -262,14 +415,15 @@ export function applyLogToRunState(state, entry) {
                 const acc = ensureAccount(state, email)
                 if (acc) {
                     acc.earnable = { mobile: Number(m[1]), browser: Number(m[2]), app: Number(m[3]) }
+                    acc.locale ??= m[5]
                 }
                 state.currentEmail = email
             }
             break
 
         case 'SEARCH-MANAGER':
-            if ((m = msg.match(RE.searchSummary)) && state.currentEmail) {
-                const acc = ensureAccount(state, state.currentEmail)
+            if ((m = msg.match(RE.searchSummary))) {
+                const acc = ensureAccount(state, accountEmailForEntry(state, entry))
                 if (acc) {
                     acc.searchSummary = {
                         mobile: Number(m[1]),
@@ -286,10 +440,10 @@ export function applyLogToRunState(state, entry) {
                 const acc = ensureAccount(state, m[8])
                 if (acc) {
                     acc.streakProtection = {
-                        enabled: m[4] === 'true',
+                        enabled: m[4] === 'null' ? null : m[4] === 'true',
                         remainingDays: m[5] === 'null' ? null : Number(m[5]),
                         streakCounter: m[6] === 'null' ? null : Number(m[6]),
-                        updatedAt: entry.ts
+                        updatedAt: eventTime(entry)
                     }
                 }
                 return 'streak-protection'
@@ -307,6 +461,9 @@ export function applyLogToRunState(state, entry) {
                     acc.success = true
                     acc.live.gained = Number(m[2])
                     acc.live.balance = Number(m[4])
+                    const at = eventTime(entry)
+                    acc.live.lastUpdateTs = at
+                    state.lastPointUpdateAt = at
                 }
                 return 'account-end'
             }
@@ -333,6 +490,7 @@ export function applyLogToRunState(state, entry) {
                     runtimeMinutes: Number(m[5])
                 }
                 state.finished = true
+                state.pendingDelay = null
                 return 'run-end'
             }
             break
@@ -354,11 +512,6 @@ export function summarizeRunState(state) {
     const collected = state.totals?.collected ?? accounts.reduce((sum, a) => sum + accountCollected(a), 0)
 
     const current = state.currentEmail ? state.accounts[state.currentEmail] : null
-    let lastUpdateTs = null
-    for (const a of accounts) {
-        if (a.live?.lastUpdateTs) lastUpdateTs = a.live.lastUpdateTs
-    }
-
     return {
         version: state.version,
         clusters: state.clusters,
@@ -367,11 +520,12 @@ export function summarizeRunState(state) {
         collected,
         totals: state.totals,
         finished: state.finished,
+        pendingDelay: state.pendingDelay,
         live: {
             currentAccount: state.currentEmail,
             currentBalance: current?.live?.balance ?? null,
             gained: collected,
-            updatedAt: lastUpdateTs
+            updatedAt: state.lastPointUpdateAt
         },
         accounts
     }

@@ -1,8 +1,13 @@
+import { URLs } from '../../../constants/urls'
 import type { BasePromotion } from '../../../interface/DashboardData'
-import { Workers } from '../../Workers'
+import { BaseActivity } from '../BaseActivity'
 
-export class UrlReward extends Workers {
+export class UrlReward extends BaseActivity {
     public async doUrlReward(promotion: BasePromotion) {
+        await this.runUrlReward(promotion, true)
+    }
+
+    private async runUrlReward(promotion: BasePromotion, allowSessionRepair: boolean) {
         const offerId = promotion.offerId
 
         const actionId = this.bot.nextActions.reportActivity
@@ -20,7 +25,7 @@ export class UrlReward extends Workers {
             this.bot.logger.warn(
                 this.bot.isMobile,
                 'URL-REWARD',
-                `Skipping ${offerId}: not present in page snapshot, even after refetching /earn`
+                `Skipping ${offerId}: not present in page snapshot, even after refetching /earn and /dashboard`
             )
             return
         }
@@ -33,7 +38,7 @@ export class UrlReward extends Workers {
             return
         }
 
-        if (this.bot.config.skipNonPointTasks && this.isNonCrediting(live.points, live.promotionSubtype, live.title)) {
+        if (this.bot.config.skipNonPointTasks && live.points === 0) {
             this.bot.logger.info(
                 this.bot.isMobile,
                 'URL-REWARD',
@@ -57,17 +62,34 @@ export class UrlReward extends Workers {
         )
 
         try {
-            const { status, acknowledged } = await this.bot.browser.func.reportServerAction(actionId, [
-                live.hash,
-                activityType,
+            const { status, acknowledged, availablePoints } = await this.bot.browser.func.reportServerAction(
+                actionId,
+                [
+                    live.hash,
+                    activityType,
+                    {
+                        offerid: offerId,
+                        isPromotional: live.isPromotional ? true : '$undefined',
+                        timezoneOffset: this.bot.userData.timezoneOffset
+                    }
+                ],
                 {
-                    offerid: offerId,
-                    isPromotional: live.isPromotional ? true : '$undefined',
-                    timezoneOffset: this.bot.userData.timezoneOffset
+                    url: URLs.rewards.dashboard,
+                    referer: URLs.rewards.dashboard,
+                    routerStateTree: this.bot.browser.react.routerStateTree('dashboard')
                 }
-            ])
+            )
 
-            const newBalance = await this.bot.browser.func.getCurrentPoints()
+            if (!acknowledged) {
+                this.bot.logger.warn(
+                    this.bot.isMobile,
+                    'URL-REWARD',
+                    `UrlReward request was not acknowledged | offerId=${offerId} | status=${status}`
+                )
+                if (await this.retryAfterRequestFailure(promotion, allowSessionRepair)) return
+            }
+
+            const newBalance = availablePoints ?? (await this.bot.browser.func.getCurrentPoints())
             const gainedPoints = newBalance - oldBalance
 
             this.bot.logger.debug(
@@ -101,22 +123,28 @@ export class UrlReward extends Workers {
                     `UrlReward credited no points | offerId=${offerId} | acknowledged=${acknowledged} | expected=${expectedPoints} | pointsGained=0 | currentBalance=${newBalance}`
                 )
             }
-
-            await this.bot.utils.wait(this.bot.utils.randomDelay(5000, 10000))
         } catch (error) {
             this.bot.logger.error(
                 this.bot.isMobile,
                 'URL-REWARD',
                 `Error in doUrlReward | offerId=${offerId} | message=${error instanceof Error ? error.message : String(error)}`
             )
+            await this.retryAfterRequestFailure(promotion, allowSessionRepair)
         }
     }
 
-    private isNonCrediting(points: number, subtype: string | null, title: string): boolean {
-        if (points > 0) return false
-        const haystack = `${subtype ?? ''} ${title ?? ''}`.toLowerCase()
+    private async retryAfterRequestFailure(promotion: BasePromotion, allowSessionRepair: boolean): Promise<boolean> {
+        if (!allowSessionRepair) return false
 
-        // Make proper language independant
-        return points === 0 || /free trial|trial|subscription|sign up|sign-up|signup/.test(haystack)
+        const refreshed = await this.bot.refreshCurrentRewardsContext(`URL-REWARD:${promotion.offerId}`)
+        if (!refreshed) return false
+
+        this.bot.logger.info(
+            this.bot.isMobile,
+            'URL-REWARD',
+            `Retrying UrlReward once with refreshed cookies and bootstrap data | offerId=${promotion.offerId}`
+        )
+        await this.runUrlReward(promotion, false)
+        return true
     }
 }

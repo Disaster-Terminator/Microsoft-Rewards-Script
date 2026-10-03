@@ -1,15 +1,28 @@
 import type { Page } from 'patchright'
 import type { MicrosoftRewardsBot } from '../../../index'
-import { getErrorMessage, getSubtitleMessage, promptInput } from './LoginUtils'
+import { canPromptForInput, getErrorMessage, getSubtitleMessage, promptInput } from './LoginUtils'
 
 export class CodeLogin {
     private readonly textInputSelector = '[data-testid="codeInputWrapper"]'
     private readonly secondairyInputSelector = 'input[id="otc-confirmation-input"], input[name="otc"]'
-    private readonly emailInputSelector = '[data-testid="proof-confirmation"]'
+    private readonly emailVerificationInputSelectors = [
+        'input#proof-confirmation-email-input',
+        '[data-testid="proof-confirmation"]'
+    ] as const
     private readonly maxManualSeconds = 60
     private readonly maxManualAttempts = 5
 
     constructor(private bot: MicrosoftRewardsBot) {}
+
+    private async findEmailVerificationInput(page: Page) {
+        for (const selector of this.emailVerificationInputSelectors) {
+            const input = await page.waitForSelector(selector, { state: 'visible', timeout: 500 }).catch(() => null)
+
+            if (input) return { input, selector }
+        }
+
+        return null
+    }
 
     private async fillCode(page: Page, code: string): Promise<boolean> {
         try {
@@ -26,7 +39,7 @@ export class CodeLogin {
                 if (stilOnPage) {
                     await page.keyboard.press('Enter')
                 }
-                this.bot.logger.info(this.bot.isMobile, 'LOGIN-CODE', `Filled code input: "${code}" `)
+                this.bot.logger.info(this.bot.isMobile, 'LOGIN-CODE', 'Filled code input')
                 return true
             }
 
@@ -42,7 +55,7 @@ export class CodeLogin {
                     await page.keyboard.press('Enter')
                 }
 
-                this.bot.logger.info(this.bot.isMobile, 'LOGIN-CODE', `Filled code input: "${code}" `)
+                this.bot.logger.info(this.bot.isMobile, 'LOGIN-CODE', 'Filled code input')
                 return true
             }
 
@@ -60,14 +73,13 @@ export class CodeLogin {
 
     private async fillEmail(page: Page, email: string): Promise<boolean> {
         try {
-            const visibleInput = await page
-                .waitForSelector(this.emailInputSelector, { state: 'visible', timeout: 500 })
-                .catch(() => null)
+            const visibleInput = await this.findEmailVerificationInput(page)
 
             if (visibleInput) {
+                await visibleInput.input.click().catch(() => {})
                 await page.keyboard.type(email, { delay: 50 })
                 await page.keyboard.press('Enter')
-                this.bot.logger.info(this.bot.isMobile, 'LOGIN-CODE', `Submitted verification email: ${email}`)
+                this.bot.logger.info(this.bot.isMobile, 'LOGIN-CODE', 'Submitted verification email')
                 return true
             }
 
@@ -87,6 +99,10 @@ export class CodeLogin {
         try {
             this.bot.logger.info(this.bot.isMobile, 'LOGIN-CODE', 'Code login authentication requested')
 
+            if (!canPromptForInput()) {
+                throw new Error('Email-code authentication requires interactive stdin; unavailable in background mode')
+            }
+
             const emailMessage = await getSubtitleMessage(page)
             if (emailMessage) {
                 this.bot.logger.info(this.bot.isMobile, 'LOGIN-CODE', `Page message: "${emailMessage}"`)
@@ -94,11 +110,16 @@ export class CodeLogin {
                 this.bot.logger.warn(this.bot.isMobile, 'LOGIN-CODE', 'Unable to retrieve email code destination')
             }
 
-            const emailProofInput = await page
-                .waitForSelector(this.emailInputSelector, { state: 'visible', timeout: 500 })
-                .catch(() => null)
+            const emailProofInput = await this.findEmailVerificationInput(page)
 
             if (emailProofInput) {
+                const selectorVariant =
+                    emailProofInput.selector === this.emailVerificationInputSelectors[0] ? 'new' : 'old'
+                this.bot.logger.debug(
+                    this.bot.isMobile,
+                    'LOGIN-CODE',
+                    `Using ${selectorVariant} email verification input selector`
+                )
                 const maskedHint = emailMessage?.match(/[A-Za-z0-9._*+-]+@[A-Za-z0-9.*-]+\.[A-Za-z]{2,}/)?.[0]
                 this.bot.logger.info(
                     this.bot.isMobile,
@@ -158,9 +179,9 @@ export class CodeLogin {
                             throw new Error(`Maximum email attempts reached: ${emailError}`)
                         }
 
-                        const inputToClear = await page.$(this.emailInputSelector).catch(() => null)
+                        const inputToClear = await this.findEmailVerificationInput(page)
                         if (inputToClear) {
-                            await inputToClear.click()
+                            await inputToClear.input.click()
                             await page.keyboard.press('Control+A')
                             await page.keyboard.press('Backspace')
                         }

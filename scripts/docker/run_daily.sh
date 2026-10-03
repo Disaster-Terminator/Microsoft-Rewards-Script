@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Preserve any value injected by the caller (e.g. SKIP_RANDOM_SLEEP=true from
-# entrypoint's RUN_ON_START prefix) before the env file can override it.
 _SKIP_SLEEP_OVERRIDE="${SKIP_RANDOM_SLEEP:-}"
 
 # Restore container environment (ACCOUNT_*, CONFIG_*, etc.) lost when cron spawns this job
@@ -22,9 +20,20 @@ cd /usr/src/microsoft-rewards-script
 
 LOCKFILE=/tmp/run_daily.lock
 
-# -------------------------------
-#  Function: Check and fix lockfile integrity
-# -------------------------------
+is_positive_integer() {
+    [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+is_nonnegative_integer() {
+    [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+is_run_daily_process() {
+    local pid="$1"
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q 'scripts/docker/run_daily\.sh'
+}
+
 self_heal_lockfile() {
     # If lockfile exists but is empty → remove it
     if [ -f "$LOCKFILE" ]; then
@@ -50,19 +59,29 @@ self_heal_lockfile() {
             rm -f "$LOCKFILE"
             return
         fi
+
+        if ! is_run_daily_process "$lock_content"; then
+            echo "[$(date)] [run_daily.sh] Lockfile PID $lock_content is not run_daily.sh → removing stale lock."
+            rm -f "$LOCKFILE"
+        fi
     fi
 }
 
-# -------------------------------
-#  Function: Acquire lock
-# -------------------------------
 acquire_lock() {
     local max_attempts=5
     local attempt=0
     local timeout_hours=${STUCK_PROCESS_TIMEOUT_HOURS:-8}
-    local timeout_seconds=$((timeout_hours * 3600))
+    local timeout_seconds
+    local existing_pid="unknown"
+
+    if ! is_positive_integer "$timeout_hours"; then
+        echo "[$(date)] [run_daily.sh] ERROR: STUCK_PROCESS_TIMEOUT_HOURS must be a positive integer." >&2
+        return 2
+    fi
+    timeout_seconds=$((timeout_hours * 3600))
 
     while [ $attempt -lt $max_attempts ]; do
+        attempt=$((attempt + 1))
         # Try to create lock with current PID
         if (set -C; echo "$$" > "$LOCKFILE") 2>/dev/null; then
             echo "[$(date)] [run_daily.sh] Lock acquired successfully (PID: $$)"
@@ -71,7 +90,6 @@ acquire_lock() {
 
         # Lock exists, validate it
         if [ -f "$LOCKFILE" ]; then
-            local existing_pid
             existing_pid=$(<"$LOCKFILE" || echo "")
 
             echo "[$(date)] [run_daily.sh] Lock file exists with PID: '$existing_pid'"
@@ -90,6 +108,12 @@ acquire_lock() {
                 continue
             fi
 
+            if ! is_run_daily_process "$existing_pid"; then
+                echo "[$(date)] [run_daily.sh] Removing stale lock owned by unrelated PID $existing_pid"
+                rm -f "$LOCKFILE"
+                continue
+            fi
+
             # Check process runtime → kill if exceeded timeout
             local process_age
             if process_age=$(ps -o etimes= -p "$existing_pid" 2>/dev/null | tr -d ' '); then
@@ -104,18 +128,14 @@ acquire_lock() {
             fi
         fi
 
-        echo "[$(date)] [run_daily.sh] Lock held by PID $existing_pid, attempt $((attempt + 1))/$max_attempts"
+        echo "[$(date)] [run_daily.sh] Lock held by PID $existing_pid, attempt $attempt/$max_attempts"
         sleep 2
-        ((attempt++))
     done
 
     echo "[$(date)] [run_daily.sh] Could not acquire lock after $max_attempts attempts; exiting."
     return 1
 }
 
-# -------------------------------
-#  Function: Release lock
-# -------------------------------
 release_lock() {
     if [ -f "$LOCKFILE" ]; then
         local lock_pid
@@ -127,30 +147,46 @@ release_lock() {
     fi
 }
 
-# Always release lock on exit - but only if we acquired it
-trap 'release_lock' EXIT INT TERM
+# Always release the lock on exit, including interrupt/termination paths.
+trap release_lock EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-# -------------------------------
-#  MAIN EXECUTION FLOW
-# -------------------------------
 echo "[$(date)] [run_daily.sh] Current process PID: $$"
 
 # Self-heal any broken or empty locks before proceeding
 self_heal_lockfile
 
-# Attempt to acquire the lock safely
-if ! acquire_lock; then
+if acquire_lock; then
+    :
+else
+    lock_status=$?
+    [ "$lock_status" -eq 2 ] && exit 1
     exit 0
 fi
 
 # Random sleep between MIN and MAX to spread execution
 MINWAIT=${MIN_SLEEP_MINUTES:-5}
 MAXWAIT=${MAX_SLEEP_MINUTES:-50}
+
+if ! is_nonnegative_integer "$MINWAIT" || ! is_nonnegative_integer "$MAXWAIT"; then
+    echo "[$(date)] [run_daily.sh] ERROR: MIN_SLEEP_MINUTES and MAX_SLEEP_MINUTES must be non-negative integers." >&2
+    exit 1
+fi
+if [ "$MAXWAIT" -lt "$MINWAIT" ]; then
+    echo "[$(date)] [run_daily.sh] ERROR: MAX_SLEEP_MINUTES must be greater than or equal to MIN_SLEEP_MINUTES." >&2
+    exit 1
+fi
+
 MINWAIT_SEC=$((MINWAIT*60))
 MAXWAIT_SEC=$((MAXWAIT*60))
 
 if [ "${SKIP_RANDOM_SLEEP:-false}" != "true" ]; then
-    SLEEPTIME=$(( MINWAIT_SEC + RANDOM % (MAXWAIT_SEC - MINWAIT_SEC) ))
+    if [ "$MAXWAIT_SEC" -eq "$MINWAIT_SEC" ]; then
+        SLEEPTIME=$MINWAIT_SEC
+    else
+        SLEEPTIME=$((MINWAIT_SEC + RANDOM % (MAXWAIT_SEC - MINWAIT_SEC + 1)))
+    fi
     echo "[$(date)] [run_daily.sh] Sleeping for $((SLEEPTIME/60)) minutes ($SLEEPTIME seconds)"
     sleep "$SLEEPTIME"
 else
@@ -161,8 +197,6 @@ fi
 echo "[$(date)] [run_daily.sh] Starting script..."
 run_status=0
 if [ "${API_MODE:-false}" = "true" ]; then
-    # API-integrated mode: delegate to the API server so the dashboard has full
-    # visibility and control.  trigger.js calls POST /start and waits for idle.
     if node scripts/api/trigger.js; then
         echo "[$(date)] [run_daily.sh] Script completed successfully (via API)."
     else

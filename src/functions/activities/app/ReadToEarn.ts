@@ -2,9 +2,9 @@ import { URLs } from '../../../constants/urls'
 import { BING_APP_USER_AGENT } from '../../../constants/userAgents'
 import type { HttpRequestConfig } from '../../../util/Http'
 import { randomBytes } from 'crypto'
-import { Workers } from '../../Workers'
+import { BaseActivity } from '../BaseActivity'
 
-export class ReadToEarn extends Workers {
+export class ReadToEarn extends BaseActivity {
     public async doReadToEarn() {
         if (!this.bot.accessToken) {
             this.bot.logger.warn(
@@ -58,7 +58,7 @@ export class ReadToEarn extends Workers {
                         'User-Agent': BING_APP_USER_AGENT,
                         'Content-Type': 'application/json',
                         'X-Rewards-Country': this.bot.userData.geoLocale,
-                        'X-Rewards-Language': 'en',
+                        'X-Rewards-Language': this.bot.userData.langCode,
                         'X-Rewards-ismobile': 'true'
                     },
                     data: JSON.stringify(jsonData)
@@ -90,7 +90,6 @@ export class ReadToEarn extends Workers {
                     break
                 }
 
-                // Update point tracking
                 this.bot.userData.currentPoints = newBalance
                 this.bot.userData.gainedPoints = (this.bot.userData.gainedPoints ?? 0) + gainedPoints
                 totalGained += gainedPoints
@@ -104,14 +103,15 @@ export class ReadToEarn extends Workers {
                     'green'
                 )
 
-                // Wait random delay between articles
                 this.bot.logger.debug(
                     this.bot.isMobile,
                     'READ-TO-EARN',
                     `Waiting between articles | article=${i + 1}/${articleCount} | delayRange=${delayMin}-${delayMax}`
                 )
 
-                await this.bot.utils.wait(this.bot.utils.randomDelay(delayMin, delayMax))
+                if (i < articleCount - 1) {
+                    await this.bot.utils.wait(this.bot.utils.randomDelay(delayMin, delayMax))
+                }
             }
 
             const finalBalance = Number(this.bot.userData.currentPoints ?? startBalance)

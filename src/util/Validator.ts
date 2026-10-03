@@ -1,9 +1,12 @@
 import { z } from 'zod'
 import semver from 'semver'
+import ms, { StringValue } from 'ms'
 import pkg from '../../package.json'
 
 import { Config } from '../interface/Config'
 import { Account } from '../interface/Account'
+import { normalizeCountry, normalizeLanguageTag } from './Locale'
+import { parseBrowserProxyUrl } from './Proxy'
 
 const NumberOrString = z.union([z.number(), z.string()])
 
@@ -15,10 +18,30 @@ const LogFilterSchema = z.object({
     regexPatterns: z.array(z.string()).optional()
 })
 
-const DelaySchema = z.object({
-    min: NumberOrString,
-    max: NumberOrString
-})
+function durationToMs(value: number | string): number | undefined {
+    return typeof value === 'number' ? value : ms(value as StringValue)
+}
+
+const DurationValue = NumberOrString.refine(value => {
+    const parsed = durationToMs(value)
+    return parsed !== undefined && Number.isFinite(parsed) && parsed >= 0
+}, 'Expected a non-negative duration')
+
+const DelaySchema = z
+    .object({
+        min: DurationValue,
+        max: DurationValue
+    })
+    .superRefine((delay, ctx) => {
+        const min = durationToMs(delay.min)
+        const max = durationToMs(delay.max)
+        if (min !== undefined && max !== undefined && max < min) {
+            ctx.addIssue({
+                code: 'custom',
+                message: 'Maximum delay must be greater than or equal to minimum delay'
+            })
+        }
+    })
 
 const QueryEngineSchema = z.union([
     z.enum(['google', 'wikipedia', 'wikirandom', 'hackernews', 'reddit', 'local']),
@@ -27,7 +50,29 @@ const QueryEngineSchema = z.union([
         .regex(/^rss(\.[A-Za-z0-9_-]+){0,2}$/, 'Invalid rss selector (use rss, rss.<site>, or rss.<site>.<endpoint>)')
 ])
 
-// Webhook
+const AccountLanguageSchema = z
+    .string()
+    .trim()
+    .min(1)
+    .refine(value => {
+        try {
+            normalizeLanguageTag(value)
+            return true
+        } catch {
+            return false
+        }
+    }, 'Expected a valid BCP 47 language tag')
+    .transform(normalizeLanguageTag)
+
+const AccountCountrySchema = z
+    .string()
+    .trim()
+    .transform(value => (value.toLowerCase() === 'auto' ? 'auto' : value.toUpperCase()))
+    .refine(
+        value => value === 'auto' || normalizeCountry(value) !== undefined,
+        'Expected "auto" or a two-letter country code'
+    )
+
 const WebhookSchema = z.object({
     discord: z
         .object({
@@ -56,7 +101,6 @@ const WebhookSchema = z.object({
     webhookLogFilter: LogFilterSchema
 })
 
-// Config
 export const ConfigSchema = z.object({
     sessionPath: z.string(),
     headless: z.boolean(),
@@ -64,7 +108,9 @@ export const ConfigSchema = z.object({
     errorDiagnostics: z.boolean(),
     ensureStreakProtection: z.boolean(),
     autoClaimPunchcardRewards: z.boolean(),
+    contintueOnBotWarning: z.boolean().default(false),
     skipNonPointTasks: z.boolean().default(true),
+    accountDelay: DelaySchema.default({ min: '1min', max: '3min' }),
     workers: z.object({
         doDailySet: z.boolean(),
         doMorePromotions: z.boolean(),
@@ -93,6 +139,7 @@ export const ConfigSchema = z.object({
         runOnZeroPoints: z.boolean().default(false),
         maxBonusSearches: z.number().default(110),
         parallelSearching: z.boolean(),
+        clusterSearch: z.boolean().default(true),
         queryEngines: z.array(QueryEngineSchema),
         searchResultVisitTime: NumberOrString,
         searchDelay: DelaySchema,
@@ -101,32 +148,97 @@ export const ConfigSchema = z.object({
     experimental: z
         .object({
             apiSearch: z.boolean().default(false),
-            apiSearchOnBing: z.boolean().default(false)
+            apiSearchOnBing: z.boolean().default(false),
+            blockMedia: z.boolean().default(false),
+            edgeBrowsing: z.boolean().default(false)
         })
-        .default({ apiSearch: false, apiSearchOnBing: false }),
+        .default({ apiSearch: false, apiSearchOnBing: false, blockMedia: false, edgeBrowsing: false }),
     debugLogs: z.boolean(),
     proxy: z.object({
-        queryEngine: z.boolean()
+        queryEngine: z.boolean(),
+        ignoreCertificateErrors: z.boolean().default(false)
     }),
     consoleLogFilter: LogFilterSchema,
     webhook: WebhookSchema
 })
 
-// Account
-export const AccountSchema = z.object({
-    email: z.string(),
-    password: z.string(),
-    totpSecret: z.string().optional(),
-    recoveryEmail: z.string(),
-    geoLocale: z.string(),
-    langCode: z.string(),
-    proxy: z.object({
+const AccountProxySchema = z
+    .object({
         proxyHttp: z.boolean(),
         url: z.string(),
         port: z.number(),
         password: z.string(),
         username: z.string()
-    }),
+    })
+    .superRefine((proxy, ctx) => {
+        const hasUrl = proxy.url.trim().length > 0
+        const hasUsername = proxy.username.length > 0
+        const hasPassword = proxy.password.length > 0
+
+        if (!hasUrl) {
+            if (proxy.proxyHttp || proxy.port !== 0 || hasUsername || hasPassword) {
+                ctx.addIssue({
+                    code: 'custom',
+                    path: ['url'],
+                    message: 'Proxy URL is required when other proxy settings are configured'
+                })
+            }
+            return
+        }
+
+        let url: URL
+        try {
+            url = parseBrowserProxyUrl(proxy.url)
+        } catch (error) {
+            ctx.addIssue({
+                code: 'custom',
+                path: ['url'],
+                message: error instanceof Error ? error.message : String(error)
+            })
+            return
+        }
+
+        if (!Number.isInteger(proxy.port) || proxy.port < 1 || proxy.port > 65535) {
+            ctx.addIssue({
+                code: 'custom',
+                path: ['port'],
+                message: 'Proxy port must be an integer from 1 to 65535'
+            })
+        }
+
+        if (url.username || url.password) {
+            ctx.addIssue({
+                code: 'custom',
+                path: ['url'],
+                message: 'Put proxy credentials in the username/password fields, not in the proxy URL'
+            })
+        }
+
+        if (hasUsername !== hasPassword) {
+            ctx.addIssue({
+                code: 'custom',
+                path: hasUsername ? ['password'] : ['username'],
+                message: 'Proxy username and password must be configured together'
+            })
+        }
+
+        if ((url.protocol === 'socks4:' || url.protocol === 'socks5:') && (hasUsername || hasPassword)) {
+            ctx.addIssue({
+                code: 'custom',
+                path: ['username'],
+                message: `${url.protocol.slice(0, -1).toUpperCase()} proxy authentication is not supported by Patchright`
+            })
+        }
+    })
+
+export const AccountSchema = z.object({
+    email: z.string(),
+    password: z.string(),
+    totpSecret: z.string().optional(),
+    recoveryEmail: z.string(),
+    geoLocale: AccountCountrySchema,
+    langCode: AccountLanguageSchema,
+    proxy: AccountProxySchema,
     saveFingerprint: z.object({
         mobile: z.boolean(),
         desktop: z.boolean()
@@ -140,7 +252,9 @@ const defaultConfig: Config = {
     errorDiagnostics: true,
     ensureStreakProtection: true,
     autoClaimPunchcardRewards: false,
+    contintueOnBotWarning: false,
     skipNonPointTasks: true,
+    accountDelay: { min: '1min', max: '3min' },
     workers: {
         doDailySet: true,
         doMorePromotions: true,
@@ -167,6 +281,7 @@ const defaultConfig: Config = {
         runOnZeroPoints: false,
         maxBonusSearches: 110,
         parallelSearching: true,
+        clusterSearch: true,
         queryEngines: ['google', 'wikipedia', 'wikirandom', 'hackernews', 'reddit', 'local'],
         searchResultVisitTime: '10sec',
         searchDelay: { min: '30sec', max: '1min' },
@@ -174,10 +289,12 @@ const defaultConfig: Config = {
     },
     experimental: {
         apiSearch: false,
-        apiSearchOnBing: false
+        apiSearchOnBing: false,
+        blockMedia: false,
+        edgeBrowsing: false
     },
     debugLogs: false,
-    proxy: { queryEngine: true },
+    proxy: { queryEngine: true, ignoreCertificateErrors: false },
     consoleLogFilter: {
         enabled: false,
         mode: 'whitelist',
@@ -222,7 +339,7 @@ function fillMissing(data: unknown, defaults: unknown, path = ''): unknown {
     if (!isPlainObject(defaults)) return data
     if (!isPlainObject(data)) {
         if (data === undefined) {
-            console.warn(`[Config] "${path || '<root>'}" missing, using default`)
+            console.warn(`[Config] WARN: "${path || '<root>'}" missing, using default`)
             return defaults
         }
         return data
@@ -231,7 +348,7 @@ function fillMissing(data: unknown, defaults: unknown, path = ''): unknown {
     for (const key of Object.keys(defaults)) {
         const p = path ? `${path}.${key}` : key
         if (!(key in result)) {
-            console.warn(`[Config] "${p}" not found, using default: ${JSON.stringify(defaults[key])}`)
+            console.warn(`[Config] WARN: "${p}" not found, using default: ${JSON.stringify(defaults[key])}`)
             result[key] = defaults[key]
         } else if (isPlainObject(defaults[key])) {
             result[key] = fillMissing(result[key], defaults[key], p)
@@ -249,7 +366,7 @@ export function validateConfig(data: unknown): Config {
     for (const issue of result.error.issues) {
         const def = getByPath(defaultConfig, issue.path as (string | number)[])
         console.warn(
-            `[Config] "${issue.path.join('.') || '<root>'}" invalid (${issue.message}), using default: ${JSON.stringify(def)}`
+            `[Config] WARN: "${issue.path.join('.') || '<root>'}" invalid (${issue.message}), using default: ${JSON.stringify(def)}`
         )
         patched = setByPath(patched, issue.path as (string | number)[], def)
     }
@@ -289,7 +406,7 @@ export function checkNodeVersion(): void {
         const requiredVersion = pkg.engines?.node
 
         if (!requiredVersion) {
-            console.warn('No Node.js version requirement found in package.json "engines" field.')
+            console.warn('[Validator] WARN: No Node.js version requirement found in package.json "engines" field.')
             return
         }
 

@@ -127,7 +127,7 @@ export enum MorePromotionShowcaseTitle {
 export type PromotionText = string | null
 
 export interface BasePromotion<
-    TAttributes = Record<string, any> | null, // Keep any
+    TAttributes = unknown,
     TTitleStyle = string,
     TDescriptionStyle = string,
     TLegalLinkText = string,
@@ -450,9 +450,13 @@ export interface RedeemPageFlights {
     destination: string
 }
 
+export interface UserWarning {
+    name: string
+}
+
 export interface Dashboard {
     userStatus: UserStatus
-    userWarnings: unknown[]
+    userWarnings: UserWarning[]
     promotionalItem: PromotionalItem
     promotionalItems: PurplePromotionalItem[]
     dailySetPromotions: { [key: string]: PromotionalItem[] }

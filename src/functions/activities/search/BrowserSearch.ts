@@ -1,9 +1,10 @@
 import type { Page } from 'patchright'
 
 import { URLs } from '../../../constants/urls'
-import { QueryCore } from '../../QueryEngine'
-import { Workers } from '../../Workers'
-import { BonusTracker } from '../SearchBonus'
+import { SearchQueryQueue } from '../../SearchQueryQueue'
+import { BaseActivity } from '../BaseActivity'
+import { BonusTracker } from './BonusTracker'
+import { SearchProgress } from './SearchProgress'
 import type { SearchTracker } from '../../../interface/Search'
 import type { MissingSearchPoints } from '../../../interface/Points'
 import type { MicrosoftRewardsBot } from '../../../index'
@@ -23,7 +24,7 @@ interface SessionStats {
     stagnant: number
 }
 
-export class Search extends Workers {
+export class Search extends BaseActivity {
     private searchCount = 0
 
     public async doSearch(page: Page, isMobile: boolean): Promise<number> {
@@ -59,7 +60,6 @@ export class Search extends Workers {
 
         const stats = await this.runSearchSession(page, isMobile, tracker)
 
-        // No active offer (or the feature is off): prepare() already logged why
         if (!tracker.started) return 0
 
         const done = tracker.done() && !tracker.offerLost
@@ -89,37 +89,35 @@ export class Search extends Workers {
             const ready = await tracker.prepare()
             if (!ready) return stats
 
-            const queryCore = new QueryCore(this.bot)
-            let queries = await this.generatePool(queryCore)
-            if (!queries.length) {
-                this.bot.logger.warn(isMobile, tracker.context, 'No queries available, skipping')
+            const queryQueue = new SearchQueryQueue(this.bot)
+            const topicCount = await queryQueue.prepare()
+            if (!topicCount) {
+                this.bot.logger.warn(isMobile, tracker.context, 'No main search topics available, skipping')
                 return stats
             }
-            this.bot.logger.info(isMobile, tracker.context, `Query pool ready | count=${queries.length}`)
+            this.bot.logger.info(
+                isMobile,
+                tracker.context,
+                `Query queue ready | mainTopics=${topicCount} | clusterSearch=${this.bot.config.searchSettings.clusterSearch}`
+            )
 
+            await this.bot.browser.func.synchronizeActiveBrowserCookies('SEARCH-COOKIE-SEED', true)
             await page.goto(URLs.bing.origin)
             await page.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {})
             await this.bot.browser.utils.tryDismissAllMessages(page)
 
-            let index = 0
-
             while (!tracker.done() && stats.performed < tracker.maxSearches && stats.stagnant < tracker.stagnantLimit) {
-                // Out of queries: pull a fresh batch, dedupe, and reshuffle
-                if (index >= queries.length) {
-                    const extra = await this.generatePool(queryCore)
-                    queries = this.bot.utils.shuffleArray([...new Set([...queries, ...extra])])
-                    if (index >= queries.length) {
-                        this.bot.logger.warn(isMobile, tracker.context, 'Query pool exhausted, stopping')
-                        break
-                    }
-                    this.bot.logger.debug(isMobile, tracker.context, `Query pool regenerated | count=${queries.length}`)
+                const query = await queryQueue.next()
+                if (!query) {
+                    this.bot.logger.warn(isMobile, tracker.context, 'Query queue exhausted, stopping')
+                    break
                 }
 
-                // Query still has to be decoded, RSS entries often have html entities, but to add a whole dependancy for that? Doesn't look natural however
-                const query = queries[index++] as string
+                await this.bot.browser.func.synchronizeActiveBrowserCookies('SEARCH-COOKIE-SEED', true)
                 await this.bingSearch(page, query, isMobile)
                 stats.performed++
 
+                await this.bot.browser.func.synchronizeActiveBrowserCookies('SEARCH-COOKIE-CAPTURE')
                 const gained = await tracker.measure()
                 if (gained > 0) {
                     stats.stagnant = 0
@@ -150,18 +148,6 @@ export class Search extends Workers {
             return stats
         }
     }
-
-    private async generatePool(queryCore: QueryCore): Promise<string[]> {
-        const pool = await queryCore.queryManager({
-            shuffle: true,
-            related: true,
-            langCode: (this.bot.userData.langCode ?? 'en').toLowerCase(),
-            geoLocale: (this.bot.userData.geoLocale ?? 'US').toUpperCase(),
-            sourceOrder: this.bot.config.searchSettings.queryEngines
-        })
-        return [...new Set(pool.map(q => q.trim()).filter(Boolean))]
-    }
-
     private async bingSearch(page: Page, query: string, isMobile: boolean): Promise<void> {
         this.searchCount++
 
@@ -210,6 +196,7 @@ export class Search extends Workers {
                     'SEARCH-BING',
                     `Search attempt ${attempt}/${MAX_QUERY_ATTEMPTS} failed | query="${query}" | ${error instanceof Error ? error.message : String(error)}`
                 )
+                if (attempt === MAX_QUERY_ATTEMPTS) throw error
                 await this.bot.utils.wait(2000)
             }
         }
@@ -217,10 +204,10 @@ export class Search extends Workers {
 
     private async randomScroll(page: Page, isMobile: boolean) {
         try {
-            const viewportHeight = await page.evaluate(() => window.innerHeight)
-            const totalHeight = await page.evaluate(() => document.body.scrollHeight)
-            const scrollPos = Math.floor(Math.random() * Math.max(1, totalHeight - viewportHeight))
-            await page.evaluate(pos => window.scrollTo({ left: 0, top: pos, behavior: 'auto' }), scrollPos)
+            await page.evaluate(() => {
+                const maxScroll = Math.max(1, document.body.scrollHeight - window.innerHeight)
+                window.scrollTo({ left: 0, top: Math.floor(Math.random() * maxScroll), behavior: 'auto' })
+            })
         } catch (error) {
             this.bot.logger.error(
                 isMobile,
@@ -259,19 +246,18 @@ class PointsTracker implements SearchTracker {
 
     private missing: MissingSearchPoints = { mobilePoints: 0, desktopPoints: 0, edgePoints: 0, totalPoints: 0 }
     private readonly runOnZeroPoints: boolean
+    private readonly searchProgress: SearchProgress
 
     constructor(
         private bot: MicrosoftRewardsBot,
         private isMobile: boolean
     ) {
         this.runOnZeroPoints = this.bot.config.searchSettings.runOnZeroPoints ?? false
+        this.searchProgress = new SearchProgress(this.bot)
     }
 
     async prepare(): Promise<boolean> {
-        this.missing = this.bot.browser.func.missingSearchPoints(
-            await this.bot.browser.func.getSearchPoints(),
-            this.isMobile
-        )
+        this.missing = await this.searchProgress.getMissing(this.isMobile)
         this.bot.logger.info(
             this.isMobile,
             this.context,
@@ -297,10 +283,7 @@ class PointsTracker implements SearchTracker {
     }
 
     async measure(): Promise<number> {
-        const updated = this.bot.browser.func.missingSearchPoints(
-            await this.bot.browser.func.getSearchPoints(),
-            this.isMobile
-        )
+        const updated = await this.searchProgress.getMissing(this.isMobile)
         const gained = Math.max(0, this.missing.totalPoints - updated.totalPoints)
         this.missing = updated
 

@@ -42,7 +42,16 @@ function consoleOut(level: LogLevel, msg: string, chalkFn: ChalkFn | null): void
 }
 
 function formatMessage(message: string | Error): string {
-    return message instanceof Error ? `${message.message}\n${message.stack || ''}` : message
+    if (!(message instanceof Error)) return message.replace(/\r?\n/g, '\\n')
+
+    const stackFrames = message.stack
+        ?.split(/\r?\n/)
+        .slice(1)
+        .map(line => line.trim())
+        .filter(Boolean)
+        .join(' <- ')
+
+    return stackFrames ? `${message.message} | stack=${stackFrames}` : message.message
 }
 
 export class Logger {
@@ -71,40 +80,14 @@ export class Logger {
         message: string | Error,
         color?: ColorKey
     ): void {
+        const config = this.bot.config
+        if (level === 'debug' && !config.debugLogs && !process.argv.includes('-dev')) return
+
         const now = new Date().toLocaleString()
         const formatted = formatMessage(message)
-
-        const userName = this.bot.userData.userName ? this.bot.userData.userName : 'MAIN'
-
+        const userName = this.bot.userData.userName || 'MAIN'
         const levelTag = level.toUpperCase()
         const cleanMsg = `[${now}] [${userName}] [${levelTag}] ${platformText(isMobile)} [${title}] ${formatted}`
-
-        const config = this.bot.config
-
-        if (level === 'debug' && !config.debugLogs && !process.argv.includes('-dev')) {
-            return
-        }
-
-        const badge = platformBadge(isMobile)
-        const consoleStr = `[${now}] [${userName}] [${levelTag}] ${badge} [${title}] ${formatted}`
-
-        let logColor: ColorKey | undefined = color
-
-        if (!logColor) {
-            switch (level) {
-                case 'error':
-                    logColor = 'red'
-                    break
-                case 'warn':
-                    logColor = 'yellow'
-                    break
-                case 'debug':
-                    logColor = 'magenta'
-                    break
-                default:
-                    break
-            }
-        }
 
         if (level === 'error' && config.errorDiagnostics) {
             const page = this.bot.isMobile ? this.bot.mainMobilePage : this.bot.mainDesktopPage
@@ -116,30 +99,38 @@ export class Logger {
         const webhookAllowed = this.shouldPassFilter(config.webhook.webhookLogFilter, level, cleanMsg)
 
         if (consoleAllowed) {
+            let logColor: ColorKey | undefined = color
+            if (!logColor) {
+                if (level === 'error') logColor = 'red'
+                else if (level === 'warn') logColor = 'yellow'
+                else if (level === 'debug') logColor = 'magenta'
+            }
+
+            const consoleStr = `[${now}] [${userName}] [${levelTag}] ${platformBadge(isMobile)} [${title}] ${formatted}`
             consoleOut(level, consoleStr, getColorFn(logColor))
         }
 
-        if (!webhookAllowed) {
-            return
-        }
+        if (!webhookAllowed || level === 'debug') return
+
+        const hasWebhook = Boolean(
+            (config.webhook.discord?.enabled && config.webhook.discord.url) ||
+            (config.webhook.ntfy?.enabled && config.webhook.ntfy.url) ||
+            (config.webhook.telegram?.enabled && config.webhook.telegram.botToken && config.webhook.telegram.chatId)
+        )
+        if (!hasWebhook) return
 
         if (cluster.isPrimary) {
             if (config.webhook.discord?.enabled && config.webhook.discord.url) {
-                if (level === 'debug') return
                 sendDiscord(config.webhook.discord.url, cleanMsg, level)
             }
-
             if (config.webhook.ntfy?.enabled && config.webhook.ntfy.url) {
-                if (level === 'debug') return
                 sendNtfy(config.webhook.ntfy, cleanMsg, level)
             }
-
             if (
                 config.webhook.telegram?.enabled &&
                 config.webhook.telegram.botToken &&
                 config.webhook.telegram.chatId
             ) {
-                if (level === 'debug') return
                 sendTelegram(config.webhook.telegram, cleanMsg, level)
             }
         } else {
@@ -148,7 +139,6 @@ export class Logger {
     }
 
     private shouldPassFilter(filter: LogFilter | undefined, level: LogLevel, message: string): boolean {
-        // If disabled or not, let all logs pass
         if (!filter || !filter.enabled) {
             return true
         }
@@ -176,7 +166,6 @@ export class Logger {
             }
         }
 
-        // Fancy regex filtering if set!
         if (!isMatch && hasPatternRule) {
             for (const pattern of regexPatterns!) {
                 try {
