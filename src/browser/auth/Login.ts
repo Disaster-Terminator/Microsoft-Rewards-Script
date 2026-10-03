@@ -53,6 +53,7 @@ export class Login {
     private readonly capturedUnknownUrls = new Set<string>()
     private signInMethodsLogged = false
     private passwordlessMethodSelected = false
+    private totpAlternativeAttempted = false
 
     private readonly selectors = {
         primaryButton: 'button[data-testid="primaryButton"]',
@@ -94,6 +95,7 @@ export class Login {
             this.capturedUnknownUrls.clear()
             this.signInMethodsLogged = false
             this.passwordlessMethodSelected = false
+            this.totpAlternativeAttempted = false
             this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Starting login process')
 
             await page
@@ -402,7 +404,8 @@ export class Login {
         if (signature.includes('m11.78 10.22a.75')) return 'PASSWORD'
         // Known passkey/security-key SVG signature keeps it out of the Authenticator fallback
         if (/picker_fido|passkey|fido|m18 16\.66a3\.51/.test(signature)) return 'PASSKEY'
-        if (/phone[\s_-]*app[\s_-]*otp|\btotp\b/.test(signature)) return 'TOTP'
+        // The modern authenticator-code tile uses a phone/monitor SVG instead of a proof-type attribute.
+        if (/phone[\s_-]*app[\s_-]*otp|\btotp\b|m8\.25 9c\.97 0 1\.75\.78/.test(signature)) return 'TOTP'
         // Known Remote NGC/mobile-app SVG signature identifies Microsoft Authenticator language-independently
         if (
             /remote[\s_-]*ngc|picker_remote_ngc|phone[\s_-]*app[\s_-]*notification|push[\s_-]*notification|m15\.75 2c16\.99 2 18 3/.test(
@@ -534,13 +537,14 @@ export class Login {
                 return true
             }
 
-            // Sign in another way - prefer offered password, then Authenticator, then interactive email code
+            // Prefer configured credentials offered by Microsoft before interactive methods.
             case 'SIGN_IN_METHOD_PICKER': {
                 const options = await this.getSignInMethodOptions(page)
                 this.logAvailableSignInMethods(options)
 
                 const methods = options.map(option => ({ option, type: this.classifySignInMethod(option) }))
                 const passwordOption = methods.find(method => method.type === 'PASSWORD')?.option
+                const totpOption = methods.find(method => method.type === 'TOTP')?.option
                 const authenticatorOption = methods.find(method => method.type === 'AUTHENTICATOR')?.option
                 const emailOption = methods.find(method => method.type === 'EMAIL')?.option
 
@@ -554,6 +558,14 @@ export class Login {
                     }
 
                     await this.waitForIdle(page, 'after password method selection')
+                    return true
+                }
+
+                if (account.totpSecret && totpOption) {
+                    this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Selecting authenticator verification code')
+                    this.passwordlessMethodSelected = false
+                    if (!(await this.clickSignInMethodOption(page, totpOption))) return false
+                    await this.waitForIdle(page, 'after authenticator code selection')
                     return true
                 }
 
@@ -776,6 +788,22 @@ export class Login {
 
             // Microsoft Authenticator approval/number challenge
             case 'LOGIN_PASSWORDLESS': {
+                if (
+                    account.totpSecret &&
+                    !this.totpAlternativeAttempted &&
+                    (await this.checkSelector(page, this.selectors.footerAction))
+                ) {
+                    this.bot.logger.info(
+                        this.bot.isMobile,
+                        'LOGIN',
+                        'Opening alternative verification methods for TOTP'
+                    )
+                    this.passwordlessMethodSelected = false
+                    if (!(await this.bot.browser.utils.ghostClick(page, this.selectors.footerAction))) return false
+                    this.totpAlternativeAttempted = true
+                    await this.waitForIdle(page, 'after alternative verification selection')
+                    return true
+                }
                 this.bot.logger.info(this.bot.isMobile, 'LOGIN', 'Handling passwordless authentication')
                 await this.passwordlessLogin.handle(page)
                 this.passwordlessMethodSelected = false

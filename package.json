@@ -20,6 +20,7 @@
         "lint": "eslint .",
         "lint:fix": "eslint . --fix",
         "test:log-parser": "node --test scripts/api/logParser.test.js",
+        "test:login-totp": "node --test scripts/tests/loginTotpSelection.test.cjs",
         "format": "prettier --write .",
         "format:check": "prettier --check .",
         "clear-diagnostics": "rimraf diagnostics",
