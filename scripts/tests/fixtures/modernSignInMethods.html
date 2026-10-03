@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+    <body>
+        <!-- Minimal reconstruction of observed method tiles. SVG paths use recorded, normalized metadata;
+             labels and click handlers are test data. No account or session data is included. -->
+        <button
+            data-testid="tile"
+            onclick="
+                document.body.dataset.selected = 'push'
+                document.getElementById('challenge').innerHTML = '<span data-testid=displaySign>Test challenge</span>'
+            "
+        >
+            <svg data-testid="tileHeaderImage">
+                <path
+                    d="m15.75 2c16.99 2 18 3 18 4.25v15.5c0 1.24-1 2.25-2.25 2.25h-7.5c7.01 22 6 21 6 19.75v4.25c6 3.01 7 2 8.25 2h7.5zm0 1.5h-7.5a.75.75 0 0 0-.75.75v15.5c0 .41.34.75.75.75h7.5c.41 0 .75-.34.75-.75v4.25a.75.75 0 0 0-.75-.75zm-1 1a.75.75 0 0 1 0 1.5h-5.5a.75.75 0 0 1 0-1.5h5.5z"
+                />
+            </svg>
+            Approve sign-in request
+        </button>
+        <button
+            data-testid="tile"
+            onclick="
+                document.body.dataset.selected = 'totp'
+                document.getElementById('challenge').innerHTML = '<input name=otc aria-label=Verification-code>'
+            "
+        >
+            <svg data-testid="tileHeaderImage">
+                <path
+                    d="m8.25 9c.97 0 1.75.78 1.75 1.75v9.5c0 .97-.78 1.75-1.75 1.75h-4.5c2.78 22 2 21.22 2 20.25v-9.5c2 9.78 2.78 9 3.75 9h4.5zm0 1.5h-4.5a.25.25 0 0 0-.25.25v9.5c0 .14.11.25.25.25h4.5c.14 0 .25-.11.25-.25v-9.5a.25.25 0 0 0-.25-.25zm-2 7.5a.75.75 0 0 1 .1 1.5h-.6a.75.75 0 0 1-.1-1.5h.6zm13.5-16c1.19 0 2.16.93 2.24 2.1v9.15c0 1.2-.92 2.17-2.09 2.24l-.15.01h16v2h1.25a.75.75 0 0 1 .1 1.5h11v-1.5h3.5v-2h11v14h8.75c.38 0 .7-.28.74-.65v-9.1a.75.75 0 0 0-.74-.75h6.25c-.38 0-.7.28-.74.65l-.01.1v8h4v4.25c0-1.2.92-2.17 2.1-2.24l6.25 2h13.5z"
+                />
+            </svg>
+            Enter a code from an authenticator app
+        </button>
+        <div id="challenge"></div>
+    </body>
+</html>
