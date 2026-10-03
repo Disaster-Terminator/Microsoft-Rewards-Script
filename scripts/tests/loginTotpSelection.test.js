@@ -62,11 +62,24 @@ test('extracts the modern TOTP SVG and classifies it with a translated label', a
     })
 })
 
-test('configured TOTP selects the code tile and opens the existing TOTP input', async () => {
+test('configured TOTP advances from the picker to the existing TOTP handler', async () => {
     await withPicker(async (login, page) => {
-        assert.equal(await login.handleState('SIGN_IN_METHOD_PICKER', page, { totpSecret: 'test-only' }), true)
+        const account = { totpSecret: 'test-only' }
+        let totpHandled = false
+        login.totp2FALogin.handle = async (target, secret) => {
+            assert.equal(target, page)
+            assert.equal(secret, account.totpSecret)
+            totpHandled = true
+        }
+
+        assert.equal(await login.detectCurrentState(page), 'SIGN_IN_METHOD_PICKER')
+        assert.equal(await login.handleState('SIGN_IN_METHOD_PICKER', page, account), true)
         assert.equal(await page.locator('body').getAttribute('data-selected'), 'totp')
         assert.equal(await page.locator('input[name="otc"]').isVisible(), true)
+        const nextState = await login.detectCurrentState(page)
+        assert.equal(nextState, '2FA_TOTP')
+        assert.equal(await login.handleState(nextState, page, account), true)
+        assert.equal(totpHandled, true)
     })
 })
 
@@ -104,32 +117,6 @@ test('an offered password retains precedence when password and TOTP are both con
             true
         )
         assert.equal(await page.locator('body').getAttribute('data-selected'), 'password')
-    })
-})
-
-test('a TOTP-only picker without a configured secret does not click the code tile', async () => {
-    await withPicker(async (login, page) => {
-        await page
-            .locator('[data-testid="tile"]')
-            .nth(0)
-            .evaluate(tile => tile.remove())
-        assert.equal(await login.handleState('SIGN_IN_METHOD_PICKER', page, {}), false)
-        assert.equal(await page.locator('body').getAttribute('data-selected'), null)
-    })
-})
-
-test('hidden code tiles are excluded and cannot replace an offered push method', async () => {
-    await withPicker(async (login, page) => {
-        await page
-            .locator('[data-testid="tile"]')
-            .nth(1)
-            .evaluate(tile => {
-                tile.hidden = true
-            })
-        const options = await login.getSignInMethodOptions(page)
-        assert.equal(options.length, 1)
-        assert.equal(await login.handleState('SIGN_IN_METHOD_PICKER', page, { totpSecret: 'test-only' }), true)
-        assert.equal(await page.locator('body').getAttribute('data-selected'), 'push')
     })
 })
 

@@ -21,6 +21,7 @@
             data-testid="tile"
             onclick="
                 document.body.dataset.selected = 'totp'
+                document.querySelectorAll('[data-testid=tile]').forEach(tile => tile.remove())
                 document.getElementById('challenge').innerHTML = '<input name=otc aria-label=Verification-code>'
             "
         >
